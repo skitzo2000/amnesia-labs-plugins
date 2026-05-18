@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""vault-resolve — fetch a vault value using a cached loa3 JWT.
+
+Designed for non-interactive use by PreToolUse hooks. If no fresh JWT
+is cached, exits with code 2 and a "run vault-unlock first" message —
+hooks must propagate that error to the user, not trigger MFA themselves
+(the AI's tool-use surface is not the right place for an interactive
+auth challenge).
+
+Server-side encryption: Brain decrypts on read using the user's
+``vault_dk`` Keycloak attribute and returns plaintext over TLS. The
+plugin doesn't see or manage keys.
+
+Usage:
+    vault-resolve <episode_id>          # uses default vault namespace
+    vault-resolve --namespace <ns> <episode_id>
+    vault-resolve --json <episode_id>   # machine-readable JSON output
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _vault_common import (  # noqa: E402
+    VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
+)
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="vault-resolve", description="Resolve a vault value.")
+    p.add_argument("episode_id", help="Vault catalog episode_id (e.g. secret:github:token)")
+    p.add_argument("--namespace", default=None,
+                   help="Vault namespace (default: derived from cached JWT email claim)")
+    p.add_argument("--json", action="store_true",
+                   help="Emit { value, env_var, value_type } as JSON to stdout")
+    args = p.parse_args(argv)
+
+    ns = args.namespace or vault_namespace()
+    try:
+        jwt = get_jwt_or_die(prompt_password=False)
+    except SystemExit:
+        sys.exit(2)
+
+    try:
+        result = brain_request(
+            "POST", "/api/v1/vault/value/get",
+            body={"namespace": ns, "episode_id": args.episode_id},
+            jwt=jwt,
+        )
+    except VaultCliError as e:
+        msg = str(e)
+        if "step_up_required" in msg or "HTTP 403" in msg:
+            print("error: vault is locked. run `vault-unlock` to refresh.",
+                  file=sys.stderr)
+            return 2
+        die(msg)
+
+    if args.json:
+        print(json.dumps({
+            "value": result["value"],
+            "env_var": result.get("env_var"),
+            "value_type": result.get("value_type"),
+        }))
+    else:
+        # Default: value to stdout, env_var to stderr so PreToolUse hook
+        # can read both without parsing JSON.
+        print(result["value"], end="")
+        env_var = result.get("env_var")
+        if env_var:
+            print(f"env_var={env_var}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

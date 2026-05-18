@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""vault-run — execute a command with vault values injected as env vars.
+
+This is the primary safe primitive for using secrets in shell commands
+without the value entering the AI's transcript.
+
+  vault-run secret:github:token -- \\
+      curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
+
+Behavior:
+  1. Resolve each <episode_id> via vault-resolve (which uses a cached
+     loa3 JWT — run vault-unlock first to complete MFA).
+  2. Export each value as $<env_var> (where env_var comes from the
+     vault catalog) into the subshell environment of the wrapped cmd.
+  3. Stream the wrapped cmd's stdout/stderr through a redactor that
+     replaces every literal occurrence of the resolved values with
+     [REDACTED:<episode_id>]. Defense-in-depth for `curl -v`,
+     `set -x`, accidental echoing.
+  4. Exit with the wrapped cmd's exit code.
+
+The value lives only in this process's memory and the cmd's env block
+for the duration of the exec. It never appears in the AI-visible
+command text, in argv (use env vars in your command, never CLI args),
+or in stdout/stderr after redaction.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _vault_common import (  # noqa: E402
+    VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
+)
+
+
+def _split_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split argv at the first `--` into (episode_ids, command)."""
+    if "--" not in argv:
+        die("usage: vault-run <episode_id> [<id> ...] -- <command...>")
+    idx = argv.index("--")
+    episode_ids = argv[:idx]
+    cmd = argv[idx + 1:]
+    if not episode_ids:
+        die("at least one episode_id is required before `--`")
+    if not cmd:
+        die("command after `--` is empty")
+    return episode_ids, cmd
+
+
+def _resolve_one(episode_id: str, ns: str, jwt: str) -> tuple[str, str]:
+    """Return (env_var, value) for *episode_id*. Server decrypts with
+    the user's Keycloak vault_dk and returns plaintext over TLS.
+    """
+    try:
+        result = brain_request(
+            "POST", "/api/v1/vault/value/get",
+            body={"namespace": ns, "episode_id": episode_id},
+            jwt=jwt,
+        )
+    except VaultCliError as e:
+        msg = str(e)
+        if "step_up_required" in msg or "HTTP 403" in msg:
+            die("vault is locked. run `vault-unlock` to refresh.", code=2)
+        die(f"resolve failed for {episode_id}: {msg}")
+    return result["env_var"], result["value"]
+
+
+def _stream_redacted(stream_in, stream_out, redactor: re.Pattern, replacements: dict[str, str]) -> None:
+    """Read *stream_in* line by line, redact, write to *stream_out*."""
+    for line in iter(stream_in.readline, ""):
+        redacted = redactor.sub(lambda m: replacements[m.group(0)], line)
+        stream_out.write(redacted)
+        stream_out.flush()
+
+
+def main(argv: list[str]) -> int:
+    episode_ids, cmd = _split_args(argv)
+
+    # Resolve namespace flag (`--namespace ns` allowed before episode_ids)
+    ns = vault_namespace()
+    if episode_ids[0] == "--namespace":
+        if len(episode_ids) < 3:
+            die("--namespace expects a value followed by at least one episode_id")
+        ns = episode_ids[1]
+        episode_ids = episode_ids[2:]
+
+    jwt = get_jwt_or_die(prompt_password=False)
+
+    # Resolve all values up front — fail fast before exec.
+    env_overlay: dict[str, str] = {}
+    redaction_map: dict[str, str] = {}
+    for eid in episode_ids:
+        env_var, value = _resolve_one(eid, ns, jwt)
+        if env_var in env_overlay and env_overlay[env_var] != value:
+            die(f"two episodes resolved to the same env var '{env_var}'")
+        env_overlay[env_var] = value
+        # Map the value to its redaction handle. We use the value itself
+        # as the key so identical values across multiple ids only redact
+        # once.
+        redaction_map[value] = f"[REDACTED:{eid}]"
+
+    # Compile redactor — sort longest-first so prefix overlaps don't
+    # break matching. Escape values for regex.
+    sorted_values = sorted(redaction_map.keys(), key=len, reverse=True)
+    redactor = re.compile("|".join(re.escape(v) for v in sorted_values))
+
+    # Build child env: parent env + overlay.
+    child_env = os.environ.copy()
+    child_env.update(env_overlay)
+
+    # Important: we use shell=False to avoid shell expansion of values
+    # in argv. The caller's command must reference vars as $NAME inside
+    # the command list, e.g. ['sh', '-c', 'curl -H "Bearer $GH_TOKEN" ...'].
+    # That's the standard pattern; raw `argv` arrays without a shell
+    # won't see env-var expansion.
+    if len(cmd) >= 2 and cmd[0] in ("sh", "bash") and cmd[1] == "-c":
+        run_cmd = cmd
+    else:
+        # Wrap implicitly so users can write:
+        #     vault-run X -- curl -H "Bearer $GH_TOKEN" ...
+        # without remembering to add `sh -c`.
+        run_cmd = ["sh", "-c", " ".join(_shell_escape(a) for a in cmd)]
+
+    proc = subprocess.Popen(
+        run_cmd,
+        env=child_env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    # Redact stdout to stdout, stderr to stderr, in parallel.
+    import threading
+    t_out = threading.Thread(
+        target=_stream_redacted,
+        args=(proc.stdout, sys.stdout, redactor, redaction_map),
+    )
+    t_err = threading.Thread(
+        target=_stream_redacted,
+        args=(proc.stderr, sys.stderr, redactor, redaction_map),
+    )
+    t_out.start(); t_err.start()
+    rc = proc.wait()
+    t_out.join(); t_err.join()
+    return rc
+
+
+def _shell_escape(s: str) -> str:
+    """Quote a string for inclusion in a `sh -c` command line."""
+    if not s or any(c in s for c in " \t\n\"'$&|;<>()*?\\"):
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+    return s
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

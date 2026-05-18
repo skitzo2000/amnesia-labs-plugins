@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""vault-unlock — complete MFA step-up and cache the loa3 JWT.
+
+Brain's vault value endpoints require an MFA-fresh JWT (acr=loa3).
+This command opens the user's browser to Keycloak, runs the standard
+auth-code + PKCE flow (password + WebAuthn / TOTP / FIDO depending on
+realm config), captures the redirect on a loopback port, exchanges the
+code for an access token, and caches it in libsecret.
+
+After unlock, ``vault-resolve`` and ``vault-run`` can fetch values for
+~120 s (the loa3 freshness window the server enforces) without
+prompting again.
+
+Encryption is server-side: Brain decrypts on read using the user's
+``vault_dk`` Keycloak attribute. The plugin doesn't manage any key
+material itself.
+
+Usage:
+    vault-unlock           # browser MFA, cache JWT
+    vault-unlock --status  # print whether unlocked
+    vault-unlock --clear   # clear cached JWT
+    vault-unlock --force   # re-authenticate even if cache is fresh
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _vault_common import (  # noqa: E402
+    discover_brain_url, get_cached_jwt, mint_loa3_jwt, clear_cached_jwt,
+    _decode_jwt_email,
+)
+
+
+def main(argv: list[str]) -> int:
+    if "--help" in argv or "-h" in argv:
+        print(__doc__)
+        return 0
+
+    brain_url = discover_brain_url()
+
+    if "--status" in argv:
+        jwt = get_cached_jwt(brain_url)
+        if jwt:
+            email = _decode_jwt_email(jwt) or "(unknown)"
+            print(f"vault: unlocked for {email} (JWT cached)")
+            return 0
+        print("vault: locked — run `vault-unlock` to complete MFA")
+        return 1
+
+    if "--clear" in argv:
+        clear_cached_jwt(brain_url)
+        print("vault: cache cleared")
+        return 0
+
+    cached_jwt = get_cached_jwt(brain_url)
+    if cached_jwt and "--force" not in argv:
+        email = _decode_jwt_email(cached_jwt) or brain_url
+        print(f"vault: already unlocked for {email} (use --force to re-authenticate)")
+        return 0
+
+    jwt, expires_at = mint_loa3_jwt(prompt=True)
+    remaining = int(expires_at - time.time())
+    email = _decode_jwt_email(jwt) or "(could not decode email from JWT)"
+    print(f"vault: unlocked for {email} for ~{remaining}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

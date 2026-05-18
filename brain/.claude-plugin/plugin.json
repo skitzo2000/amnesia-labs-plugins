@@ -1,0 +1,20 @@
+{
+  "name": "brain",
+  "version": "0.6.0",
+  "description": "Persistent memory for AI agents. 4-store architecture with intelligent routing. Recall before searching, store what you learn, close the feedback loop. Includes vault: server-encrypted secrets (per-user key in Keycloak) the AI can use without ever seeing the value. Plus the research skill for knowledge-driven development.",
+  "author": {
+    "name": "paul",
+    "url": "https://git.thenortonfamily.net/paul/brain"
+  },
+  "keywords": [
+    "memory",
+    "knowledge",
+    "research",
+    "persistence",
+    "recall",
+    "learning",
+    "vault",
+    "secrets"
+  ],
+  "changelog": "v0.6.0 — Vault moves encryption server-side. Brain now encrypts values with the user's Keycloak vault_dk before writing to the DB and decrypts on read; the plugin no longer touches keys. Cloud secret entry: AI calls s(target='vault_drop', ...) → gets a server-hosted form URL → user pastes the value in the browser. Plugin shrinks from 10 helpers to 3 (vault-unlock, vault-resolve, vault-run); no cryptography Python dep. v0.5.2 — Zero-config vault helpers via OAuth discovery + shared brain-plugin-client. v0.5.1 — Restored the research skill (knowledge-driven development loop). v0.5.0 — Vault first cut."
+}

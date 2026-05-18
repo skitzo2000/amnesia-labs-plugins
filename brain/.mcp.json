@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "b": {
+      "type": "http",
+      "url": "${BRAIN_URL:-http://localhost:8002}/mcp/"
+    }
+  }
+}

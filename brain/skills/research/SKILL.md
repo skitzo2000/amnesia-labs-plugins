@@ -1,0 +1,35 @@
+---
+name: research
+description: "Knowledge-driven development. Discover domain expertise in Brain, retrieve at the right depth, expand via research when gaps found, learn from project outcomes. Use when building anything — recall domain knowledge before coding, store lessons after. Triggers: 'research X', 'what do we know about X', 'how do I build/deploy/animate X', implementing any feature where domain knowledge would help."
+---
+%bp2 research|knowledge-driven development|loop=DISCOVER→RETRIEVE→APPLY→LEARN→EXPAND
+%rule First-fire transparency: when this skill activates, announce your plan in one line BEFORE running the loop — e.g. "I'll check Brain first for what we know about X, then expand to web/docs if there's a gap." Don't ask permission; just state intent. The user can redirect ("skip the loop", "just google it", "go straight to docs", "small gap, don't expand") and you adapt. This keeps proactive activation user-controllable without a confirmation prompt every time.
+%rule ALWAYS recall before WebSearch / Grep / Read / Glob. Brain probably already has it. The point of this loop is "what do we know" before "let's go find out."
+%rule Storage: target=episodic is primary — creates vector embeddings AND preserves full text, so it's both searchable and quotable. Episode IDs use prefixes: full:<topic> for reference knowledge, lesson:<project>:<topic> for project-specific learnings, error:<slug> for solved problems, convention:<scope>:<name> for standards. Keep individual entries under 500 words; split large content by sub-topic. No angle brackets in stored text (parser-hostile). Retrieve with mode=episodic — the semantic store may be empty.
+%rule Brainpack target is SECONDARY (and easy to misuse). It compresses content for retrieval-time token efficiency, but the compression preset matters: `brainpack` (27-30% loss, BrainPack v2 HTTP, near-lossless) vs `conversation` (70%+ loss, pipeline, lossy). Set the domain profile's compression_preset to `brainpack` BEFORE storing or you'll lose most of the content: `p(action="set", namespace, profile_data={compression_preset: "brainpack"})`. Skip brainpack entirely under 200 tokens; just use episodic.
+%rule Token budgets when brainpacking: API refs 800-1000, recipes/code 600-800, overviews 400-600. summary_ratio: API refs 0.8-0.9, recipes 0.8, overviews 0.7. Large entries: use parent_chunks=true with chunk_size=512 / overlap=64 — Brain stores the parent plus overlapping child chunks; retrieval returns the parent when child passages match. This is how you exceed the 500-word cap without sacrificing search granularity.
+%rule LEARN every loop. After applying recalled knowledge, call f(namespace, episode_id, outcome="success"|"failure", notes=why). Store new lessons as episodic with `lesson:<project>:<topic>`. New patterns: s(target="concept") + s(target="link"). Cross-project connections: s(target="cross_reference"). This is what makes Brain get smarter — skipping it leaves outcome scoring stuck at 1.0x and recall doesn't improve.
+%rule EXPAND when Brain comes up empty. Small gap: WebSearch/WebFetch then store the answer episodically so next recall succeeds. Large gap: spawn parallel research agents in rounds — R0 breadth (5-8 agents, build a taxonomy), R1 depth (authoritative docs, library API references, split by sub-topic), R2 creative (awards-winning libs, edge cases, inspiration). Update the taxonomy episode after each round. Split each agent's findings into sub-topic entries under 500 words each.
+%rule Anti-patterns: Don't use brainpack as primary without tuning compression_preset — you'll destroy 70% of the content. Don't store mega-entries — split at 500 words or use parent_chunks. Don't use mode="semantic" without verifying the graph isn't empty — fall back to mode="episodic" or "auto". Don't put HTML/XML tags in stored text (breaks parser). Don't recall for trivia. Don't store ephemeral state. Don't skip feedback. Don't research what Brain already knows.
+%when intent|action
+What do we know about X|r(query="X", mode="auto") then r(query="X", mode="discover") if cross-domain hint
+Research X (small gap)|r() first; if empty, WebSearch/WebFetch; store result as episodic full:X
+Research X (large gap)|Multi-round agent loop. R0: 5-8 breadth agents → taxonomy. R1: depth on each branch. R2: creative/inspirational.
+Implementing a library/feature|r(query="<lib> API reference", mode="episodic", max_tokens=3000) for depth, then r(query="<lib> recipe", mode="episodic") for working examples
+Domain overview|r(query="<domain> overview", mode="auto", max_tokens=2000)
+Library comparison|r(query="<task> library comparison", mode="discover", namespaces=[<candidates>])
+Best practices|r(query="<topic> performance rules" or "<topic> conventions", namespaces=["conventions"])
+Emerging tech|r(query="<domain> emerging 2026", mode="discover")
+Prior art|r(query="lesson <topic>", mode="episodic", time_range_days=365)
+Cross-namespace concept|r(query="<concept>", mode="discover", namespaces=[ns1, ns2])
+Apply succeeded|f(namespace, episode_id, outcome="success", notes=what worked)
+Apply failed|f(namespace, episode_id, outcome="failure", notes=why)
+New lesson|s(namespace, target="episodic", data={episode_id="lesson:<project>:<topic>", text=...})
+Novel error solved|s(namespace="errors", target="episodic", data={episode_id="error:<slug>", text=problem+solution})
+Convention discovered|s(namespace="conventions", target="brainpack", data={chunk_id, text}) AFTER setting profile compression_preset=brainpack
+Cross-project link|s(target="cross_reference", data={from_concept, to_namespace, to_concept, reason})
+%depths R0|overview|domain map / taxonomy / what-exists
+R1|deep|API surface, signatures, parameters, library internals
+R2|creative|edge cases, awards, inspiration, novel approaches
+%routing Techniques→domain overview · Implement→library API ref + recipe · Code→effect recipe · Choice→library comparison · Practice→performance rules / conventions · Emerging→domain emerging · Prior art→lesson:<topic>
+%ns vault(creds, no values surfaced — see brain skill) · conventions(standards) · errors(solved problems) · skills(skill definitions) · infra(hosts/services) · per-domain (e.g. web-animations, crypto-trading)
