@@ -10,11 +10,6 @@
             "command": "bash ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/brain-session-start.sh",
             "timeout": 30000,
             "statusMessage": "Loading Brain memory..."
-          },
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/session_start_version_check.py",
-            "timeout": 5
           }
         ]
       }
