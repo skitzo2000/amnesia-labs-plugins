@@ -56,9 +56,9 @@ def die(msg: str, code: int = 1) -> None:
 # Discovery — figure out Brain URL, Keycloak issuer, OAuth endpoints
 # ---------------------------------------------------------------------------
 
-# Shared public OAuth client Brain registers in both NortonFamily and
-# amnesia-labs realms. PKCE-friendly, no client_secret. The same client
-# Claude Code uses for MCP OAuth — piggybacks on existing infrastructure.
+# Shared public OAuth client registered in each Brain-backed Keycloak realm.
+# PKCE-friendly, no client_secret. Piggybacks on the same client Claude Code
+# uses for MCP OAuth.
 SHARED_CLIENT_ID = "brain-plugin-client"
 
 

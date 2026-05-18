@@ -1,6 +1,6 @@
 {
   "name": "amnesia-labs",
-  "description": "Claude Code plugins by Amnesia Labs.",
+  "description": "Amnesia Labs internal plugins (alpha).",
   "owner": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
@@ -8,22 +8,12 @@
   "plugins": [
     {
       "name": "brain",
-      "description": "Persistent memory for AI agents. 4-store architecture (sensory/episodic/semantic/chronological) with intelligent routing, knowledge-driven research loop, and server-encrypted vault for secrets.",
+      "description": "Internal alpha. Invite only.",
       "source": "./brain",
       "version": "0.7.0",
       "author": {
-        "name": "Paul Norton",
-        "url": "https://amnesia-labs.com"
-      },
-      "keywords": [
-        "memory",
-        "knowledge",
-        "research",
-        "persistence",
-        "recall",
-        "vault",
-        "secrets"
-      ]
+        "name": "Amnesia Labs"
+      }
     }
   ]
 }
