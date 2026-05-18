@@ -1,33 +1,19 @@
 {
-  "description": "Brain memory hooks: session lifecycle, Brain-first search, self-learning feedback loop",
+  "description": "Brain memory hooks: session lifecycle (context_brief auto-load + transcript auto-save), Brain-first search, vault redaction, self-learning feedback loop",
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup",
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Brain: call ss(namespace='$BRAIN_NAMESPACE', action=start, session_id='$BRAIN_SESSION_ID', project_path=pwd, goals=infer from context). Use context_brief.\"}}'",
-            "timeout": 5
+            "command": "bash ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/brain-session-start.sh",
+            "timeout": 30000,
+            "statusMessage": "Loading Brain memory..."
           },
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/brain}/hooks/session_start_version_check.py",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Brain: resumed session. Call ss(namespace='$BRAIN_NAMESPACE', action=start, session_id='$BRAIN_SESSION_ID', project_path=pwd, goals=continue prior work). Use context_brief to restore context.\"}}'",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/brain}/hooks/session_start_version_check.py",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/session_start_version_check.py",
             "timeout": 5
           }
         ]
@@ -35,11 +21,13 @@
     ],
     "Stop": [
       {
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'Brain: 1) If recalled content was used this session, call f() with success/failure for each episode_id. 2) Store any hard-won insights as episodic entries. 3) Save session with ss(namespace=$BRAIN_NAMESPACE, action=save, session_id=$BRAIN_SESSION_ID, summary=accomplished, key_decisions=decisions, files_modified=files, outcome=completed). Skip if trivial.'",
-            "timeout": 5
+            "command": "bash ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/brain-session-save.sh",
+            "timeout": 30000,
+            "statusMessage": "Saving session to Brain..."
           }
         ]
       }
@@ -68,7 +56,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/brain}/hooks/pre_bash_vault.py",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/pre_bash_vault.py",
             "timeout": 5
           }
         ]
@@ -95,7 +83,7 @@
           },
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/brain}/hooks/post_bash_vault_redact.py",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/post_bash_vault_redact.py",
             "timeout": 5
           }
         ]

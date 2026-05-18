@@ -10,7 +10,7 @@
       "name": "brain",
       "description": "Persistent memory for AI agents. 4-store architecture (sensory/episodic/semantic/chronological) with intelligent routing, knowledge-driven research loop, and server-encrypted vault for secrets.",
       "source": "./brain",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "author": {
         "name": "Paul Norton",
         "url": "https://amnesia-labs.com"
