@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.8.1 — drop trailing slash on MCP URL; the /mcp/ → /mcp redirect strips Authorization and caused invalid_token loops on first connect."
+  "changelog": "v0.8.2 — default Brain URL to https://brain.amnesia-labs.com (was localhost:8002); BRAIN_URL env var still overrides for self-hosted setups."
 }

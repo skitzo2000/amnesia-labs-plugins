@@ -12,7 +12,7 @@ NAMESPACE="${BRAIN_NAMESPACE:-$(basename "$PWD")}"
 SESSION_ID="${BRAIN_SESSION_ID:-unknown}"
 TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('transcript_path',''))" 2>/dev/null || echo "")
 
-BRAIN_URL="${BRAIN_URL:-http://localhost:8002}"
+BRAIN_URL="${BRAIN_URL:-https://brain.amnesia-labs.com}"
 BRAIN_MCP_URL="${BRAIN_URL%/}/mcp/"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}"
 BRAIN_TOKEN_SCRIPT="${PLUGIN_ROOT}/bin/get-brain-token.sh"

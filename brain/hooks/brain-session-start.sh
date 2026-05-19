@@ -5,7 +5,7 @@
 # 3. Injects context_brief into Claude's initial context
 #
 # Required env (set once in your shell, e.g. ~/.bashrc):
-#   BRAIN_URL              — base URL of your Brain deployment (defaults to localhost:8002)
+#   BRAIN_URL              — base URL of your Brain deployment (defaults to https://brain.amnesia-labs.com)
 #   KEYCLOAK_TOKEN_URL     — Keycloak token endpoint
 #   KEYCLOAK_CLIENT_ID     — Brain client_id from Keycloak (e.g. brain-paul-amnesia-labs-com)
 #   KEYCLOAK_CLIENT_SECRET — Brain client secret
@@ -23,7 +23,7 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export BRAIN_SESSION_ID=$SESSION_ID" >> "$CLAUDE_ENV_FILE"
 fi
 
-BRAIN_URL="${BRAIN_URL:-http://localhost:8002}"
+BRAIN_URL="${BRAIN_URL:-https://brain.amnesia-labs.com}"
 BRAIN_MCP_URL="${BRAIN_URL%/}/mcp/"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}"
 BRAIN_TOKEN_SCRIPT="${PLUGIN_ROOT}/bin/get-brain-token.sh"
