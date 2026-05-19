@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.8.0 — marketplace cutover."
+  "changelog": "v0.8.1 — drop trailing slash on MCP URL; the /mcp/ → /mcp redirect strips Authorization and caused invalid_token loops on first connect."
 }
