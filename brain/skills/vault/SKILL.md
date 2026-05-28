@@ -1,0 +1,33 @@
+---
+name: vault
+description: "Secrets vault for Brain — store/rotate/use/list API keys, tokens, passwords, credentials so the AI NEVER sees the value. Vault flow is s(target='vault_drop',...) → drop_url; the user pastes into a browser form, the server encrypts. NEVER ask the user to paste a value in chat. TRIGGER ON ANY MENTION OF: vault, secret, secrets, token, API key, password, credential, credentials, .env, save/store/add/rotate/use/list a key, 'my X token/key/secret/password'. Value injection (vault-run/vault-unlock) is local Claude Code only; catalog recall, drop-URL, and escalation-URL flows work anywhere."
+---
+%bp2 vault|secrets
+%tools b.r=recall(catalog + value-handle) b.s=store(vault_drop) · bin: vault-run(inject value into one Bash cmd) vault-unlock(browser MFA → loa3 window) vault-resolve
+%req Depends on the Brain MCP server (tools r/s) and the brain plugin's bin scripts. Catalog recall and drop_url relay work in any host (Claude Code, web, SDK). Value access — vault-run/vault-unlock — is local Claude Code ONLY; on web/SDK there are no local binaries, so surface the escalation_url or tell the user to complete the step in local CC. Vault is alpha; if the backend is unreachable, say so plainly and continue without it.
+%rule Brain-first still applies: r(namespace="<user>:vault", query) before assuming a secret isn't stored. r(namespace="<user>:vault") returns CATALOG ONLY (episode_id, env_var, purpose, related). The server holds Fernet-encrypted values, decrypts on read with the user's Keycloak vault_dk; loa3 (MFA) gates all value access. Use natural language; never ask the user to type episode_ids or paste values in chat.
+%rule FORBIDDEN: NEVER ask the user to paste a secret/key/token/password value in chat. NEVER offer "paste it anyway, I'll store it" or "store a placeholder" as options. NEVER ask clarifying Qs when the service name is clear ("test key for test service" → episode_id="secret:test:test", env_var="TEST_TEST", just fire the drop). The ONLY correct path for any "save/store/add/rotate my X" request is s(target="vault_drop",...) → relay drop_url. The AI must never see the value.
+%rule Patterns:
+  • "save/store/add my X [token|secret|key|password]" → infer episode_id from convention, then s(namespace="<user>:vault", target="vault_drop", data={episode_id, env_var, purpose, value_type?}) which returns {drop_url, expires_in}. Relay the URL to the user; they open it in a browser, paste the value into the server-hosted form, the server encrypts + stores. The AI never sees the value.
+  • "rotate my X" → same s(target="vault_drop", data={episode_id, env_var, ..., overwrite:true}). The drop form replaces the existing value on submit.
+  • "use my X [for Y]" / "with my X token" → r(namespace="<user>:vault", query="X") to find episode_id, then r(namespace="<user>:vault", episode_id="<found>") to verify loa3 + get the invocation hint. The second call returns one of: (a) status="ready" with env_var + invocation.local_plugin shape (e.g. `vault-run secret:hf:token -- <cmd using $HF_TOKEN>`) — run that in Bash (local CC); (b) status="step_up_required" with escalation_url — show the URL to the user (cloud AI/web) or tell them to run `vault-unlock` (local CC), wait for confirmation, retry the same r() call. The value never appears in any r() response; vault-run is the only path that touches plaintext and it redacts child stdout/stderr. NEVER inline `<<vault:...>>` in commands (PreToolUse blocks it).
+  • "what's in my vault" / "list my secrets" → r(namespace="<user>:vault") — returns the catalog. No values.
+  • "who accessed X" / "vault activity" → r(namespace="<user>:vault", query="X", mode="chronological") — audit trail.
+  Confirm names only when ambiguous. Otherwise infer and proceed.
+%rule Naming: episode_id = `secret:<service>:<purpose-or-key>` (e.g. `secret:github:token`, `secret:openai:api-key`, `secret:keycloak:cloudflare-access:amnesia-labs`). env_var = `<SERVICE>_<TYPE>` uppercase (`GH_TOKEN`, `OPENAI_API_KEY`, `KEYCLOAK_CLIENT_SECRET`). value_type ∈ token|password|client_secret|api_key|private_key.
+%rule Catalog text shape: when a vault catalog episode is written (either by drop_submit server-side, or by the AI describing a credential in `<user>:vault`), lead the `text` with the searchable identifiers as bare tokens — split the colon-delimited episode_id into segments, then env_var, then value_type — and append any purpose/free-text last. Example: `text="secret github token GH_TOKEN token GitHub PAT for CI"` rather than `"The GitHub PAT — injected as $GH_TOKEN for CI"`. Single-keyword recall ("github", "GH_TOKEN", "token") cosine-matches the keyword head where prose connectors bury those terms.
+%when moment|tool
+User: "save/store/add my X token"|s(namespace="<user>:vault", target="vault_drop", data={episode_id:"secret:<svc>:<purpose>", env_var:"<SVC>_TOKEN", purpose:"..."}) → relay returned drop_url to user
+User: "rotate my X"|s(target="vault_drop", data={episode_id, env_var, ..., overwrite:true}) → relay drop_url
+User: "use my X to ..."|r(namespace="<user>:vault", query="X") to find episode_id → r(namespace="<user>:vault", episode_id=<found>) → if status="ready": Bash `vault-run <id> -- <cmd using $ENV_VAR>` (local CC); if status="step_up_required": surface escalation_url (cloud AI/web) or tell user to `vault-unlock` (local CC), retry r() after.
+User: "what's in my vault"|r(namespace="<user>:vault")
+User: vault activity / who accessed|r(namespace="<user>:vault", query="X", mode="chronological")
+User: "vault is locked" / first vault use|local CC → tell user to run `vault-unlock` (browser MFA via WebAuthn, ~120s loa3 window). web/SDK → surface the escalation_url from the step_up_required response instead.
+%api
+r(namespace="<user>:vault", query | episode_id, mode="auto"|"chronological")
+Value-handle path: when namespace is a vault namespace and episode_id is set, r() verifies loa3 freshness and returns either {status:"ready", env_var, invocation} or {status:"step_up_required", escalation_url, unlock_hint}. **The value is never returned** — invocation.local_plugin points the AI at vault-run.
+s(namespace="<user>:vault", target="vault_drop", data={episode_id, env_var, purpose, value_type?, overwrite?}) → {drop_url, expires_in}
+%profiles pattern|score_threshold|decay_rate|retrieval_mode
+Vault|0.4|0.005|flat
+%ns namespace|purpose|key
+vault|Secrets (catalog only — values never surfaced)|secret:{svc}:{key}

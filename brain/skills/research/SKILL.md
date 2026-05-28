@@ -32,4 +32,4 @@ Cross-project link|s(target="cross_reference", data={from_concept, to_namespace,
 R1|deep|API surface, signatures, parameters, library internals
 R2|creative|edge cases, awards, inspiration, novel approaches
 %routing Techniques→domain overview · Implement→library API ref + recipe · Code→effect recipe · Choice→library comparison · Practice→performance rules / conventions · Emerging→domain emerging · Prior art→lesson:<topic>
-%ns vault(creds, no values surfaced — see brain skill) · conventions(standards) · errors(solved problems) · skills(skill definitions) · infra(hosts/services) · per-domain (e.g. web-animations, crypto-trading)
+%ns vault(creds, no values surfaced — see vault skill) · conventions(standards) · errors(solved problems) · skills(skill definitions) · infra(hosts/services) · per-domain (e.g. web-animations, crypto-trading)

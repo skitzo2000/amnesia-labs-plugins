@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.8.2 — default Brain URL to https://brain.amnesia-labs.com (was localhost:8002); BRAIN_URL env var still overrides for self-hosted setups."
+  "changelog": "v0.9.0 — split vault into its own skill so persistent memory works in any host (Claude Code, web, SDK) while vault declares its own local-CC value-access compatibility. The brain skill is now pure recall/store/session/feedback; secret/token/credential mentions route to the new vault skill."
 }
