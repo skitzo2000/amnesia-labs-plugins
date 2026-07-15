@@ -230,6 +230,12 @@ def _secret_tool_clear(**attrs: str) -> None:
 
 def _store_with_expiry(*, kind: str, account: str, value: str,
                        expires_at: int, label: str) -> None:
+    # Single-item invariant: `exp` is part of the attribute set, so
+    # secret-tool store never REPLACES an earlier token (different exp
+    # = different item). Without this clear, items accumulate across
+    # unlocks and reads match the OLDEST (expired) one — vault-run then
+    # reports "no fresh loa3 JWT" while a valid token sits in the store.
+    _secret_tool_clear(service=_SCHEMA_SERVICE, kind=kind, account=account)
     _secret_tool_store(
         label, value,
         service=_SCHEMA_SERVICE,
@@ -238,11 +244,6 @@ def _store_with_expiry(*, kind: str, account: str, value: str,
 
 
 def _read_with_expiry(*, kind: str, account: str, min_remaining: int = 30) -> Optional[str]:
-    token = _secret_tool_lookup(
-        service=_SCHEMA_SERVICE, kind=kind, account=account,
-    )
-    if not token:
-        return None
     try:
         proc = subprocess.run(
             ["secret-tool", "search", "--all",
@@ -251,20 +252,31 @@ def _read_with_expiry(*, kind: str, account: str, min_remaining: int = 30) -> Op
         )
     except FileNotFoundError:
         return None
-    # `secret-tool search` writes the matched item's label + secret to
-    # stdout but the attribute lines (`attribute.exp = …`) go to stderr.
-    # Parsing stdout silently dropped the expiry, leaving exp=0 → return
-    # None → "no fresh JWT" even for a valid cached token. Read stderr.
-    exp = 0
-    for line in (proc.stdout + "\n" + proc.stderr).splitlines():
+    # `secret-tool search` writes each matched item's label + secret to
+    # stdout and its attribute lines (`attribute.exp = …`) to stderr, in
+    # the same item order on both streams. Installs that predate the
+    # store-time clear accumulated one item PER UNLOCK, and taking the
+    # first exp matched the oldest (expired) token — vault-run reported
+    # "no fresh loa3 JWT" while a valid one sat in the store. Zip the
+    # streams and take the freshest pair instead.
+    secrets_in_order = [
+        line.split("=", 1)[1].strip()
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("secret =")
+    ]
+    exps_in_order = []
+    for line in proc.stderr.splitlines():
         line = line.strip()
         if line.startswith("attribute.exp ="):
             try:
-                exp = int(line.split("=", 1)[1].strip())
+                exps_in_order.append(int(line.split("=", 1)[1].strip()))
             except ValueError:
-                exp = 0
-            break
-    if exp == 0 or time.time() >= (exp - min_remaining):
+                exps_in_order.append(0)
+    pairs = list(zip(secrets_in_order, exps_in_order))
+    if not pairs:
+        return None
+    token, exp = max(pairs, key=lambda p: p[1])
+    if not token or exp == 0 or time.time() >= (exp - min_remaining):
         return None
     return token
 

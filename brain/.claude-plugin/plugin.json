@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.9.1 — vault + recall UX. Vault skill now relays the drop-link deadline in human terms (server default is 600s, up from 90s) and re-mints expired links immediately with ttl up to 1800s; corrected stale ~120s loa3 window claims to the server's 300s default. Brain skill gains a Known-gap bypass: when Brain provably can't have the answer (topic already recalled empty this session, inherently fresh/external info, or the user says so), search externally without blocking on recall — then store what you find. Prior: v0.9.0 split vault into its own skill for cross-host compatibility."
+  "changelog": "v0.9.2 \u2014 fix loa3 JWT cache poisoning: exp is part of the libsecret attribute set, so every unlock stored a NEW item and reads matched the oldest (expired) token, making vault-run report 'no fresh loa3 JWT' right after a successful vault-unlock. Store now clears prior items (single-item invariant) and the reader picks the freshest secret/exp pair, self-healing legacy piles. Prior: v0.9.1 vault drop deadlines + brain-first known-gap bypass."
 }
