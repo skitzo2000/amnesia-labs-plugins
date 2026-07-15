@@ -5,6 +5,7 @@ description: "Persistent memory. MCP server b, tools r/s/ss/p/f/a/rr. ALWAYS rec
 %bp2 brain|memory
 %tools b.r=recall b.s=store b.ss=session b.p=profile b.f=feedback b.a=admin b.rr=research
 %rule Brain first, search second. Before searching ANYWHERE — internet (WebSearch/WebFetch), filesystem (Glob/Grep/Read), or running exploratory commands (Bash) — check r(query) first. Brain already knows project structure, file locations, conventions, past decisions, and error solutions. (Secrets live in the vault — see the separate vault skill.) Only search externally after Brain recall comes up empty or insufficient.
+%rule Known-gap bypass: the brain-first gate does NOT apply when Brain provably can't have the answer — go straight to the external search, don't block on a recall you know will be empty. Qualifying cases: (a) r() on this topic already came up empty this session — do not re-recall variations of the same query before every subsequent search; (b) inherently fresh/external info Brain wouldn't hold: current events, latest release/version numbers, live service status, pricing, third-party docs for a tool this user has never stored knowledge about; (c) the user explicitly says to search the web / that Brain doesn't know. After the external search succeeds, the Empty-recall rule still applies: store what you found so the gap closes.
 %rule Cross-domain: use mode="discover" or namespaces=["ns1","ns2"] when answer may exist in another domain.
 %rule Namespace-free: omit namespace to search all accessible non-protected namespaces. Results grouped by namespace. Drill into specific namespace for full content + sensory data.
 %rule Self-learning: ALWAYS close the feedback loop. After using recalled content, call f() with outcome. After solving a hard problem, store the insight. After hitting a novel error, store to errors namespace. After learning a convention, store to conventions. This is not optional.
@@ -16,7 +17,7 @@ description: "Persistent memory. MCP server b, tools r/s/ss/p/f/a/rr. ALWAYS rec
 Session starts|ss(action="start", namespace, session_id, project_path, goals, plugin_version=<from local plugin.json>)
 ss() response has plugin_update?|If plugin_update.available=true, tell user: "Brain plugin update available: v{current} → v{latest}. Run /brain-update to install."
 Need context|r(query) or r(namespace, query) if you know the namespace
-Before ANY search|r(query) first — omit namespace to search everything accessible
+Before ANY search|r(query) first — omit namespace to search everything accessible; skip if the Known-gap bypass applies (topic already recalled empty this session, or inherently fresh/external info)
 Don't know where something is|r() before find/ls/grep — Brain knows file locations, project structure, past work
 Learn something|s(namespace, target="episodic", data={episode_id, text})
 Discover pattern|s(target="concept") + s(target="link")

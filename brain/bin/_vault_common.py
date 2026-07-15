@@ -475,7 +475,7 @@ def get_jwt_or_die(*, prompt_password: bool) -> str:
     if not prompt_password:
         die(
             "no fresh loa3 JWT in cache. Run `vault-unlock` to complete MFA. "
-            "Cached tokens are valid for ~120s (loa3 freshness window)."
+            "Cached tokens are valid for ~5 min (loa3 freshness window, server default 300s)."
         )
     token, _ = mint_loa3_jwt(prompt=True)
     return token

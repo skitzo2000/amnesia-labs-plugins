@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.9.0 — split vault into its own skill so persistent memory works in any host (Claude Code, web, SDK) while vault declares its own local-CC value-access compatibility. The brain skill is now pure recall/store/session/feedback; secret/token/credential mentions route to the new vault skill."
+  "changelog": "v0.9.1 — vault + recall UX. Vault skill now relays the drop-link deadline in human terms (server default is 600s, up from 90s) and re-mints expired links immediately with ttl up to 1800s; corrected stale ~120s loa3 window claims to the server's 300s default. Brain skill gains a Known-gap bypass: when Brain provably can't have the answer (topic already recalled empty this session, inherently fresh/external info, or the user says so), search externally without blocking on recall — then store what you find. Prior: v0.9.0 split vault into its own skill for cross-host compatibility."
 }

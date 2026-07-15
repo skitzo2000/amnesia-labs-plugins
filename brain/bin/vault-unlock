@@ -8,8 +8,8 @@ realm config), captures the redirect on a loopback port, exchanges the
 code for an access token, and caches it in libsecret.
 
 After unlock, ``vault-resolve`` and ``vault-run`` can fetch values for
-~120 s (the loa3 freshness window the server enforces) without
-prompting again.
+~5 min (the loa3 freshness window the server enforces —
+ACR_LOA3_MAX_AGE_SECONDS, default 300 s) without prompting again.
 
 Encryption is server-side: Brain decrypts on read using the user's
 ``vault_dk`` Keycloak attribute. The plugin doesn't manage any key
