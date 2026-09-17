@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.9.2 \u2014 fix loa3 JWT cache poisoning: exp is part of the libsecret attribute set, so every unlock stored a NEW item and reads matched the oldest (expired) token, making vault-run report 'no fresh loa3 JWT' right after a successful vault-unlock. Store now clears prior items (single-item invariant) and the reader picks the freshest secret/exp pair, self-healing legacy piles. Prior: v0.9.1 vault drop deadlines + brain-first known-gap bypass."
+  "changelog": "v0.10.0 \u2014 session hooks need no configuration: they reuse the Brain login Claude Code already holds for the plugin's MCP server (read-only from Claude Code's credential store; expired access tokens are refreshed with the stored offline token and cached in ~/.cache/brain-mcp). Removes bin/get-brain-token.sh and the KEYCLOAK_TOKEN_URL/CLIENT_ID/CLIENT_SECRET requirement, which made every portal-onboarded user see 'Brain: auth failed' and silently skipped session saves (issue #1). Hook failures now say why and how to fix it (/mcp). Prior: v0.9.2 loa3 JWT cache poisoning fix."
 }

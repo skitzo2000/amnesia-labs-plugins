@@ -12,24 +12,20 @@ NAMESPACE="${BRAIN_NAMESPACE:-$(basename "$PWD")}"
 SESSION_ID="${BRAIN_SESSION_ID:-unknown}"
 TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('transcript_path',''))" 2>/dev/null || echo "")
 
-BRAIN_URL="${BRAIN_URL:-https://brain.amnesia-labs.com}"
-BRAIN_MCP_URL="${BRAIN_URL%/}/mcp/"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}"
-BRAIN_TOKEN_SCRIPT="${PLUGIN_ROOT}/bin/get-brain-token.sh"
+
+# Auth reuses Claude Code's Brain login (bin/brain-hook-auth). On failure the
+# SessionStart hook has already told the AI why; the Stop hook stays silent
+# so it doesn't repeat that on every turn.
+AUTH_JSON=$(python3 "$PLUGIN_ROOT/bin/brain-hook-auth" 2>/dev/null)
+AUTH=$(echo "$AUTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('authorization',''))" 2>/dev/null || echo "")
+BRAIN_MCP_URL=$(echo "$AUTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mcp_url',''))" 2>/dev/null || echo "")
+
+if [ -z "$AUTH" ] || [ -z "$BRAIN_MCP_URL" ]; then
+  exit 0
+fi
+
 HEADERS_TMP=$(mktemp)
-
-if [ ! -x "$BRAIN_TOKEN_SCRIPT" ]; then
-  rm -f "$HEADERS_TMP"
-  exit 0
-fi
-
-TOKEN_JSON=$("$BRAIN_TOKEN_SCRIPT" 2>/dev/null || echo '{}')
-AUTH=$(echo "$TOKEN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Authorization',''))" 2>/dev/null || echo "")
-
-if [ -z "$AUTH" ]; then
-  rm -f "$HEADERS_TMP"
-  exit 0
-fi
 
 PAYLOAD_JSON='{}'
 if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then

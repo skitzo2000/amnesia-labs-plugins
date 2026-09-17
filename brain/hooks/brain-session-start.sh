@@ -4,13 +4,10 @@
 # 2. Calls Brain MCP directly to start the session
 # 3. Injects context_brief into Claude's initial context
 #
-# Required env (set once in your shell, e.g. ~/.bashrc):
-#   BRAIN_URL              — base URL of your Brain deployment (defaults to https://brain.amnesia-labs.com)
-#   KEYCLOAK_TOKEN_URL     — Keycloak token endpoint
-#   KEYCLOAK_CLIENT_ID     — Brain client_id from Keycloak (e.g. brain-paul-amnesia-labs-com)
-#   KEYCLOAK_CLIENT_SECRET — Brain client secret
-#
-# Without these the hook degrades gracefully and tells the AI to call ss() itself.
+# No configuration: auth reuses the Brain login Claude Code holds for the
+# plugin's MCP server (see bin/brain-hook-auth). If that login is missing or
+# can't be refreshed, the hook says exactly that and tells the AI to call
+# ss() itself.
 
 set -uo pipefail
 
@@ -23,27 +20,25 @@ if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export BRAIN_SESSION_ID=$SESSION_ID" >> "$CLAUDE_ENV_FILE"
 fi
 
-BRAIN_URL="${BRAIN_URL:-https://brain.amnesia-labs.com}"
-BRAIN_MCP_URL="${BRAIN_URL%/}/mcp/"
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}"
-BRAIN_TOKEN_SCRIPT="${PLUGIN_ROOT}/bin/get-brain-token.sh"
+MANUAL_START="Call ss(namespace=$NAMESPACE, action=start, session_id=$SESSION_ID, project_path=$PWD, goals=infer from context) manually."
+
+# Emit SessionStart additionalContext with proper JSON escaping.
+emit_context() {
+  CTX="$1" python3 -c 'import json,os; print(json.dumps({"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":os.environ["CTX"]}}))'
+}
+
+AUTH_JSON=$(python3 "$PLUGIN_ROOT/bin/brain-hook-auth" 2>/dev/null)
+AUTH=$(echo "$AUTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('authorization',''))" 2>/dev/null || echo "")
+BRAIN_MCP_URL=$(echo "$AUTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mcp_url',''))" 2>/dev/null || echo "")
+
+if [ -z "$AUTH" ] || [ -z "$BRAIN_MCP_URL" ]; then
+  REASON=$(echo "$AUTH_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null)
+  emit_context "Brain hooks: ${REASON:-could not get a token from your Brain login}. $MANUAL_START"
+  exit 0
+fi
+
 HEADERS_TMP=$(mktemp)
-
-if [ ! -x "$BRAIN_TOKEN_SCRIPT" ]; then
-  echo "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Brain: token script missing. Call ss(namespace=$NAMESPACE, action=start, session_id=$SESSION_ID, project_path=$PWD, goals=infer from context) manually.\"}}"
-  rm -f "$HEADERS_TMP"
-  exit 0
-fi
-
-TOKEN_JSON=$("$BRAIN_TOKEN_SCRIPT" 2>/dev/null || echo '{}')
-AUTH=$(echo "$TOKEN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('Authorization',''))" 2>/dev/null || echo "")
-
-if [ -z "$AUTH" ]; then
-  echo "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Brain: auth failed. Call ss(namespace=$NAMESPACE, action=start, session_id=$SESSION_ID, project_path=$PWD, goals=infer from context) manually.\"}}"
-  rm -f "$HEADERS_TMP"
-  exit 0
-fi
-
 INIT=$(curl -s --max-time 8 -D "$HEADERS_TMP" \
   -H "Authorization: $AUTH" \
   -H "Content-Type: application/json" \
@@ -55,7 +50,7 @@ MCP_SID=$(grep -i 'mcp-session-id' "$HEADERS_TMP" 2>/dev/null | tr -d '\r' | awk
 rm -f "$HEADERS_TMP"
 
 if [ -z "$MCP_SID" ]; then
-  echo "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Brain: MCP init failed against $BRAIN_MCP_URL. Call ss(namespace=$NAMESPACE, action=start, session_id=$SESSION_ID, project_path=$PWD, goals=infer from context) manually.\"}}"
+  emit_context "Brain: MCP init failed against $BRAIN_MCP_URL. $MANUAL_START"
   exit 0
 fi
 

@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""brain-hook-auth — bearer token for the session hooks, from the user's Brain login.
+
+The hooks call Brain's MCP endpoint directly, outside Claude Code's MCP
+client, so they need a token of their own. Rather than asking users to
+configure a second credential, reuse the OAuth login Claude Code already
+holds for the plugin's `b` server (the `/mcp` login): Claude Code keeps
+the access token, the offline refresh token and the DCR client id in its
+credential store. We read it, never write it.
+
+  - access token still valid  -> use it
+  - expired                   -> refresh_token grant against the issuer
+                                 (public client, no secret); the result is
+                                 cached in ~/.cache/brain-mcp so the Stop
+                                 hook doesn't refresh on every turn
+  - no login / refresh denied -> {"error": "<what the user should do>"}
+
+Output (stdout, one JSON object):
+  {"authorization": "Bearer ...", "mcp_url": "https://host/mcp/"}   exit 0
+  {"error": "..."}                                                  exit 1
+
+Tokens never go to stderr or into error messages.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import platform
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+SERVER_NAME = "plugin:brain:b"
+MIN_REMAINING = 60  # seconds of validity a token must have left to be used
+LOGIN_HINT = "run /mcp, select the brain server (plugin:brain:b) and authenticate"
+
+
+class AuthError(Exception):
+    pass
+
+
+def _base(url: str) -> str:
+    """https://host/mcp/ -> https://host"""
+    return url.rstrip("/").removesuffix("/mcp").rstrip("/")
+
+
+def _load_credentials() -> dict:
+    """Claude Code's credential store: Keychain on macOS, else .credentials.json."""
+    if platform.system() == "Darwin":
+        try:
+            out = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return json.loads(out.stdout)
+        except Exception:
+            pass
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    path = config_dir / ".credentials.json"
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        raise AuthError(f"could not read Claude Code credentials ({type(e).__name__})")
+
+
+def _pick_login(creds: dict) -> Optional[dict]:
+    """The brain server's OAuth entry. Prefer one matching $BRAIN_URL, then
+    ones that can refresh, then the freshest."""
+    entries = [
+        v for v in (creds.get("mcpOAuth") or {}).values()
+        if isinstance(v, dict) and v.get("serverName") == SERVER_NAME and v.get("accessToken")
+    ]
+    if not entries:
+        return None
+    wanted = os.environ.get("BRAIN_URL")
+    if wanted:
+        matching = [e for e in entries if _base(e.get("serverUrl", "")) == _base(wanted)]
+        entries = matching or entries
+    return max(entries, key=lambda e: (bool(e.get("refreshToken")), e.get("expiresAt") or 0))
+
+
+def _cache_path(login: dict) -> Path:
+    cache_dir = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "brain-mcp"
+    # Keyed by the login's refresh token, so a new /mcp login never reuses
+    # a token cached for the previous one.
+    key = hashlib.sha256((login.get("refreshToken") or "").encode()).hexdigest()[:16]
+    return cache_dir / f"hook-token-{key}.json"
+
+
+def _read_cache(path: Path) -> Optional[str]:
+    try:
+        d = json.loads(path.read_text())
+        if d.get("access_token") and time.time() < d.get("expires_at", 0) - MIN_REMAINING:
+            return d["access_token"]
+    except Exception:
+        pass
+    return None
+
+
+def _write_cache(path: Path, token: str, expires_at: int) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        for stale in path.parent.glob("hook-token-*.json"):
+            if stale != path:
+                stale.unlink(missing_ok=True)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"access_token": token, "expires_at": expires_at}, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass  # cache is an optimisation only
+
+
+def _token_endpoint(login: dict) -> str:
+    issuer = (login.get("discoveryState") or {}).get("authorizationServerUrl") or login.get("issuer")
+    if not issuer:
+        raise AuthError(f"stored Brain login has no issuer — {LOGIN_HINT}")
+    url = f"{issuer.rstrip('/')}/.well-known/openid-configuration"
+    try:
+        with urllib.request.urlopen(url, timeout=8) as resp:
+            return json.loads(resp.read())["token_endpoint"]
+    except Exception as e:
+        raise AuthError(f"could not reach the Brain login server ({type(e).__name__})")
+
+
+def _refresh(login: dict) -> tuple[str, int]:
+    if not login.get("refreshToken") or not login.get("clientId"):
+        raise AuthError(f"Brain login has expired and cannot be refreshed — {LOGIN_HINT}")
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": login["refreshToken"],
+        "client_id": login["clientId"],
+    }).encode()
+    req = urllib.request.Request(
+        _token_endpoint(login), data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            raise AuthError(f"Brain login was rejected on refresh (session revoked or expired) — {LOGIN_HINT}")
+        raise AuthError(f"Brain login server returned HTTP {e.code} on refresh")
+    except Exception as e:
+        raise AuthError(f"could not reach the Brain login server ({type(e).__name__})")
+    token = payload.get("access_token")
+    if not token:
+        raise AuthError("Brain login server returned no access token on refresh")
+    return token, int(time.time()) + int(payload.get("expires_in") or 300)
+
+
+def get_auth() -> dict:
+    login = _pick_login(_load_credentials())
+    if login is None:
+        raise AuthError(f"not logged in to Brain — {LOGIN_HINT}")
+    mcp_url = _base(login.get("serverUrl") or os.environ.get("BRAIN_URL", "")) + "/mcp/"
+
+    expires_at = (login.get("expiresAt") or 0) / 1000  # Claude Code stores ms
+    if time.time() < expires_at - MIN_REMAINING:
+        token = login["accessToken"]
+    else:
+        cache = _cache_path(login)
+        token = _read_cache(cache)
+        if token is None:
+            token, exp = _refresh(login)
+            _write_cache(cache, token, exp)
+    return {"authorization": f"Bearer {token}", "mcp_url": mcp_url}
+
+
+def main() -> int:
+    try:
+        print(json.dumps(get_auth()))
+        return 0
+    except AuthError as e:
+        print(json.dumps({"error": str(e)}))
+        return 1
+    except Exception as e:  # never let a hook see a traceback with context
+        print(json.dumps({"error": f"hook auth failed unexpectedly ({type(e).__name__})"}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
