@@ -101,14 +101,39 @@ def _expand_shell_default(value: str) -> str:
     return re.sub(r"\$\{([^}]*)\}", _sub, value)
 
 
-def _remote_manifest() -> dict | None:
-    """Fetch the public version manifest. Returns None on any failure."""
-    base = _brain_url()
+# Sentinels for the two 404s that are worth telling the operator about,
+# as opposed to the failures (server down, no network) that stay silent.
+_NO_ENDPOINT = "no-endpoint"    # the route itself is missing — stale server
+_NOT_PUBLISHED = "not-published"  # route is there, plugin store is empty
+
+
+def _remote_manifest(base: str) -> dict | str | None:
+    """Fetch the public version manifest.
+
+    Returns the manifest dict on success, one of the `_NO_ENDPOINT` /
+    `_NOT_PUBLISHED` sentinels on a 404, and None on every other failure
+    (unreachable, timeout, malformed body) so the hook stays quiet when
+    the answer is "cannot tell".
+
+    The two 404s are told apart by the body: the endpoint answers a JSON
+    error naming the plugin when the store is empty, while a server that
+    predates the endpoint 404s from the router with no such body.
+    """
     url = f"{base}/api/v1/api/plugin/latest/version"
     try:
         with urllib.request.urlopen(url, timeout=_TIMEOUT_S) as resp:
             return json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return None
+        try:
+            body = json.loads(exc.read().decode())
+        except Exception:
+            return _NO_ENDPOINT
+        if isinstance(body, dict) and body.get("status") == "error":
+            return _NOT_PUBLISHED
+        return _NO_ENDPOINT
+    except (urllib.error.URLError, OSError, ValueError):
         return None
 
 
@@ -137,8 +162,27 @@ def _is_newer(candidate: str, current: str) -> bool:
 
 def main() -> int:
     local = _local_version()
-    remote = _remote_manifest()
-    if not local or not remote:
+    base = _brain_url()
+    remote = _remote_manifest(base)
+
+    # A 404 is not "you are up to date" — it means this Brain cannot answer
+    # the question at all, which no install could tell apart from silence
+    # until #231. Say it once, to the one person who can fix it.
+    if remote == _NO_ENDPOINT:
+        _emit(
+            f"Brain at {base} does not serve /api/v1/api/plugin/latest/version "
+            "(404) — it is running a build older than the update notifier, so "
+            "plugin update checks are off until that server is redeployed."
+        )
+        return 0
+    if remote == _NOT_PUBLISHED:
+        _emit(
+            f"Brain at {base} has no published 'brain' plugin — its plugin "
+            "store is empty, so /brain-update has nothing to install."
+        )
+        return 0
+
+    if not local or not isinstance(remote, dict):
         return 0  # silent no-op
     latest = remote.get("version")
     if not latest or not _is_newer(latest, local):

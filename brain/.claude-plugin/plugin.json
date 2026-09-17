@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.10.1 \u2014 fold in the 0.9.3\u20130.9.7 lineage that only ever existed in the maintained local install, so the marketplace copy is a strict superset of what the plugin store serves. Brings over: the vault step-up fixes (vault-unlock reads /api/v1/vault/policy and applies the server's loa3 window, requests acr_values=loa3 with no max_age/prompt=login, gains --status and --force-login; vault-run/vault-resolve report the server's reason instead of guessing at local lock state; the vault skill documents the ungated value handle), hooks/session_start_version_check.py wired into SessionStart (semver compare, expands the ${BRAIN_URL:-...} placeholder when reading .mcp.json off disk), the trailing slash on .mcp.json's /mcp/ path (Brain 307-redirects /mcp and the MCP client does not follow it on reconnect), and dropping the WebSearch/WebFetch and Glob/Grep prompt hooks that fired on every search. The 0.10.0 hook auth is unchanged. Prior: v0.10.0 \u2014 session hooks need no configuration: they reuse the Brain login Claude Code already holds for the plugin's MCP server (read-only from Claude Code's credential store; expired access tokens are refreshed with the stored offline token and cached in ~/.cache/brain-mcp). Removes bin/get-brain-token.sh and the KEYCLOAK_TOKEN_URL/CLIENT_ID/CLIENT_SECRET requirement, which made every portal-onboarded user see 'Brain: auth failed' and silently skipped session saves (issue #1). Hook failures now say why and how to fix it (/mcp). Prior: v0.9.2 loa3 JWT cache poisoning fix."
+  "changelog": "v0.10.2 — the SessionStart update check now says when the server cannot answer it. A 404 from /api/v1/api/plugin/latest/version used to be indistinguishable from \"you are up to date\": the hook failed quiet, so no install ever learned an update existed while brain.amnesia-labs.com ran a build predating the endpoint (brain#231). The hook now tells the two 404s apart — a missing route (stale server) and an empty plugin store — and reports each in one line. Every other failure stays silent. Prior: v0.10.1 folded in the 0.9.3–0.9.7 store lineage."
 }
