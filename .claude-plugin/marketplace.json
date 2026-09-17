@@ -10,7 +10,7 @@
       "name": "brain",
       "description": "Internal alpha. Invite only.",
       "source": "./brain",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "author": {
         "name": "Amnesia Labs"
       }

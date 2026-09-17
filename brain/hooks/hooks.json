@@ -10,6 +10,11 @@
             "command": "bash ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/brain-session-start.sh",
             "timeout": 30000,
             "statusMessage": "Loading Brain memory..."
+          },
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/session_start_version_check.py",
+            "timeout": 5000
           }
         ]
       }
@@ -28,24 +33,6 @@
       }
     ],
     "PreToolUse": [
-      {
-        "matcher": "WebSearch|WebFetch",
-        "hooks": [
-          {
-            "type": "prompt",
-            "prompt": "Brain first: r(namespace=$BRAIN_NAMESPACE, query=search query). Check vault, errors, conventions, infra if relevant. Internet after Brain if full relevance not found."
-          }
-        ]
-      },
-      {
-        "matcher": "Glob|Grep",
-        "hooks": [
-          {
-            "type": "prompt",
-            "prompt": "Brain knows this codebase. Before searching files, check r(namespace=$BRAIN_NAMESPACE, query=what you're looking for). Brain stores project structure, file locations, conventions, and past decisions. Only search the filesystem if Brain recall is empty or insufficient."
-          }
-        ]
-      },
       {
         "matcher": "Bash",
         "hooks": [

@@ -44,12 +44,68 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 class VaultCliError(RuntimeError):
-    """Anything the CLI surfaces to the user via stderr + exit code."""
+    """Anything the CLI surfaces to the user via stderr + exit code.
+
+    *status* and *payload* carry the HTTP status and decoded JSON body when
+    the failure came from Brain, so callers can diagnose a rejection rather
+    than pattern-matching the rendered message.
+    """
+
+    def __init__(self, message: str, *, status: Optional[int] = None,
+                 payload: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.payload = payload or {}
 
 
 def die(msg: str, code: int = 1) -> None:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def explain_denial(err: VaultCliError) -> Optional[str]:
+    """Turn a Brain auth rejection into an accurate, actionable sentence.
+
+    Every 403 used to be reported as "vault is locked. run `vault-unlock`
+    to refresh." — which describes LOCAL cache state and is wrong for every
+    server-side rejection. When the real cause was a stale ``auth_time``,
+    running vault-unlock changed nothing (it saw an unexpired token and
+    declined), so the advice sent people round a loop that could not
+    terminate (issue #192). Returns None when this is not an auth denial.
+    """
+    payload = err.payload or {}
+    if err.status not in (401, 403) and payload.get("error") != "step_up_required":
+        return None
+
+    if payload.get("error") != "step_up_required":
+        return "brain rejected the token (not a step-up denial): " + str(err)
+
+    reason = payload.get("reason")
+    current = payload.get("current_acr")
+    required = payload.get("required_acr", "loa3")
+
+    if reason == "stale_auth_time":
+        age = payload.get("auth_age_seconds")
+        window = payload.get("max_age_seconds")
+        return (
+            f"MFA is too old: last completed {age}s ago, server accepts "
+            f"{window}s. Run `vault-unlock` to re-authenticate."
+        )
+    if reason == "missing_auth_time":
+        return (
+            "token carries acr but no auth_time claim, so the server cannot "
+            "confirm freshness. Run `vault-unlock --force`."
+        )
+    if not current:
+        return (
+            f"token carries no acr claim at all, so it can never satisfy "
+            f"{required}. This is the wrong token for vault access — it is "
+            "not the one `vault-unlock` caches. Run `vault-unlock`."
+        )
+    return (
+        f"token is {current}, vault values require {required}. "
+        "Run `vault-unlock` to complete MFA."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -148,17 +204,88 @@ def discover_oauth_metadata(brain_url: str) -> dict[str, str]:
     return meta
 
 
-def _decode_jwt_email(jwt: str) -> Optional[str]:
+def decode_jwt_claims(jwt: str) -> dict:
     """Decode the JWT payload (no signature check — we just authenticated
-    against the issuer) and return the email claim.
+    against the issuer). Returns {} on any malformed input.
     """
     try:
         payload_b64 = jwt.split(".")[1]
         payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode())
-        return payload.get("email") or payload.get("preferred_username")
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64).decode())
+        return claims if isinstance(claims, dict) else {}
     except Exception:
+        return {}
+
+
+def _decode_jwt_email(jwt: str) -> Optional[str]:
+    """Return the JWT's email claim (or preferred_username)."""
+    claims = decode_jwt_claims(jwt)
+    return claims.get("email") or claims.get("preferred_username")
+
+
+def jwt_auth_age(jwt: str) -> Optional[int]:
+    """Seconds since the user last entered credentials, per ``auth_time``.
+
+    ``None`` when the claim is absent — callers must treat that as "cannot
+    prove freshness" and re-authenticate rather than assume the token is
+    good. The server does the same (``_check_required_acr`` rejects an
+    acr-bearing token with no auth_time).
+    """
+    raw = decode_jwt_claims(jwt).get("auth_time")
+    try:
+        auth_time = int(raw) if raw else 0
+    except (TypeError, ValueError):
         return None
+    if auth_time <= 0:
+        return None
+    return int(time.time()) - auth_time
+
+
+# The loa3 freshness window is a SERVER policy (ACR_LOA3_MAX_AGE_SECONDS).
+# This is only the fallback for a server too old to serve /vault/policy —
+# it matches src/config.py's default. Deliberately not tuned by hand: a
+# client guess that disagrees with the server is what produced the unlock
+# loop in the first place (see fetch_loa3_window).
+_LOA3_WINDOW_FALLBACK = 300
+
+# Re-authenticating costs a browser round-trip, so leave a margin: a token
+# with 3 seconds of window left is not worth handing to vault-run.
+_LOA3_WINDOW_MARGIN = 15
+
+_loa3_window_cache: dict[str, int] = {}
+
+
+def fetch_loa3_window(jwt: Optional[str] = None) -> int:
+    """Return the server's loa3 freshness window in seconds.
+
+    ``vault-unlock`` previously called a cached JWT "unlocked" for as long
+    as the token was unexpired (~15 min), while the server rejects a value
+    read once ``auth_time`` exceeds this window. On a deployment with the
+    window at 120s that left ten minutes in which vault-unlock said
+    "already unlocked" and vault-run said "vault is locked" — and since
+    vault-unlock refused to re-auth while a token was cached, no sequence
+    of commands could recover (issue #192). Asking the server removes the
+    disagreement instead of papering over it with a second guess.
+
+    Falls back to the documented default when the endpoint is missing or
+    unreachable — an older server is a reason to be conservative, not to
+    fail the unlock.
+    """
+    url = discover_brain_url()
+    if url in _loa3_window_cache:
+        return _loa3_window_cache[url]
+
+    window = _LOA3_WINDOW_FALLBACK
+    if jwt:
+        try:
+            policy = brain_request("GET", "/api/v1/vault/policy", jwt=jwt)
+            candidate = int(policy.get("loa3_max_age_seconds") or 0)
+            if candidate > 0:
+                window = candidate
+        except Exception:
+            pass
+    _loa3_window_cache[url] = window
+    return window
 
 
 def _sanitize_email(s: str) -> str:
@@ -289,8 +416,29 @@ def store_jwt(account: str, access_token: str, expires_at: int) -> None:
     )
 
 
-def get_cached_jwt(account: str) -> Optional[str]:
-    return _read_with_expiry(kind="jwt", account=account)
+def get_cached_jwt(account: str, *, max_auth_age: Optional[int] = None) -> Optional[str]:
+    """Return the cached JWT, or None if it is not usable for a value read.
+
+    Two independent expiries have to hold, and only the first used to be
+    checked:
+
+      * ``exp`` — the token's own lifetime (~15 min from Keycloak).
+      * ``auth_time`` age vs *max_auth_age* — the server's loa3 freshness
+        window (~300 s). A token can be minutes from expiry and already
+        too stale for ``/vault/value/get``.
+
+    Pass *max_auth_age* (from :func:`fetch_loa3_window`) wherever the
+    answer feeds a value read, so "unlocked" means the same thing on both
+    ends of the wire. Omit it for identity-only uses such as deriving the
+    vault namespace.
+    """
+    token = _read_with_expiry(kind="jwt", account=account)
+    if token is None or max_auth_age is None:
+        return token
+    age = jwt_auth_age(token)
+    if age is None or age > max(0, max_auth_age - _LOA3_WINDOW_MARGIN):
+        return None
+    return token
 
 
 def clear_cached_jwt(account: str) -> None:
@@ -380,10 +528,70 @@ def _osc8_link(url: str, label: Optional[str] = None) -> str:
     return f"\033]8;;{url}\033\\{label or url}\033]8;;\033\\"
 
 
-def mint_loa3_jwt(*, prompt: bool = True, ttl: int = 180) -> tuple[str, int]:
+#: OIDC parameters that force Keycloak to re-run the WHOLE browser flow —
+#: password and all — rather than stepping up only the expired factor. None
+#: of these may appear on a routine unlock.
+FULL_REAUTH_PARAMS = ("max_age", "prompt")
+
+
+def build_authorize_params(
+    *, redirect_uri: str, challenge: str, state: str, nonce: str,
+    force_full_login: bool = False,
+) -> dict:
+    """Build the authorization-request params for a loa3 step-up.
+
+    **loa3 expires; loa1 does not.** Stepping up means re-running the factor
+    that went stale, not the whole login. `acr_values=loa3` alone lets
+    Keycloak's Conditional-LoA flow see that the live SSO session already
+    satisfies loa1/loa2 and run only the loa3 execution.
+
+    Two previous attempts got this wrong in the same way, which is why
+    there is a test pinning the behaviour rather than the spelling:
+
+    * v0.9.2 sent ``prompt=login`` — an explicit full re-authentication.
+    * v0.9.3 "fixed" it with ``max_age=0``, on the reasoning that it would
+      force a fresh ``auth_time`` without a full login form. It does not.
+      OIDC ``max_age=0`` asserts the user authenticated no more than zero
+      seconds ago, so *every* level is stale and Keycloak re-runs the entire
+      flow — password included. Same symptom, different parameter.
+
+    Nor can we send ``max_age=<brain's window>``: an SSO session hours old
+    satisfies loa1 perfectly legitimately, and any ``max_age`` marks that
+    stale too and demands the password again. Per-level freshness is a
+    **realm** concern — the ``max-age`` configured on the loa3 conditional
+    subflow — and that is the only thing that should decide whether the
+    second factor is re-challenged.
+
+    *force_full_login* adds ``prompt=login`` deliberately, as an escape
+    hatch for a wedged session. Never the default.
+    """
+    params = {
+        "client_id": SHARED_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": "openid email profile",
+        "acr_values": "loa3",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+        "nonce": nonce,
+    }
+    if force_full_login:
+        params["prompt"] = "login"
+    return params
+
+
+def mint_loa3_jwt(
+    *, prompt: bool = True, ttl: int = 180, force_full_login: bool = False
+) -> tuple[str, int]:
     """Mint a fresh JWT with acr=loa3 via authorization-code + PKCE on
     a loopback redirect. Auto-discovers everything; uses the shared
     public ``brain-plugin-client``.
+
+    Requests a step-up only: the existing SSO session keeps satisfying
+    loa1/loa2 and Keycloak re-runs just the loa3 factor. Pass
+    *force_full_login* to add ``prompt=login`` and re-authenticate from
+    scratch — an escape hatch for a wedged session, never the default.
     """
     if not prompt:
         die("loa3 JWT not cached and prompt=False; run `vault-unlock`")
@@ -404,18 +612,10 @@ def mint_loa3_jwt(*, prompt: bool = True, ttl: int = 180) -> tuple[str, int]:
         host, port = srv.server_address
         redirect_uri = f"http://{host}:{port}/callback"
 
-        params = {
-            "client_id": SHARED_CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": "openid email profile",
-            "acr_values": "loa3",
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-            "nonce": nonce,
-            "prompt": "login",
-        }
+        params = build_authorize_params(
+            redirect_uri=redirect_uri, challenge=challenge,
+            state=state, nonce=nonce, force_full_login=force_full_login,
+        )
         authorize = f"{meta['authorization_endpoint']}?" + urllib.parse.urlencode(params)
 
         sys.stderr.write(
@@ -479,15 +679,31 @@ def mint_loa3_jwt(*, prompt: bool = True, ttl: int = 180) -> tuple[str, int]:
 
 
 def get_jwt_or_die(*, prompt_password: bool) -> str:
-    """Return a usable JWT — cached if fresh, otherwise minted (or error)."""
+    """Return a JWT the server will accept for a value read, or exit.
+
+    The unexpired cached token is good enough to ASK the server for its
+    policy (``/vault/policy`` is catalog-grade — no acr required), so it
+    is used for that even when it is too stale to spend on a value read.
+    """
     brain_url = discover_brain_url()
-    cached = get_cached_jwt(brain_url)
+    unexpired = _read_with_expiry(kind="jwt", account=brain_url)
+    window = fetch_loa3_window(unexpired)
+
+    cached = get_cached_jwt(brain_url, max_auth_age=window)
     if cached:
         return cached
+
     if not prompt_password:
+        age = jwt_auth_age(unexpired) if unexpired else None
+        if age is not None:
+            die(
+                f"cached loa3 JWT is stale: last MFA was {age}s ago, server "
+                f"accepts {window}s. Run `vault-unlock` to re-authenticate."
+            )
         die(
             "no fresh loa3 JWT in cache. Run `vault-unlock` to complete MFA. "
-            "Cached tokens are valid for ~5 min (loa3 freshness window, server default 300s)."
+            f"Cached tokens are usable for {window}s after MFA (the server's "
+            "loa3 freshness window)."
         )
     token, _ = mint_loa3_jwt(prompt=True)
     return token
@@ -539,7 +755,9 @@ def brain_request(
         except Exception:
             parsed = None
         raise VaultCliError(
-            f"HTTP {e.code} from {method} {path}: {parsed or body_text or e.reason}"
+            f"HTTP {e.code} from {method} {path}: {parsed or body_text or e.reason}",
+            status=e.code,
+            payload=parsed if isinstance(parsed, dict) else None,
         )
     except Exception as e:
         raise VaultCliError(f"{method} {path} failed: {e}")

@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
+    explain_denial,
 )
 
 
@@ -63,10 +64,10 @@ def _resolve_one(episode_id: str, ns: str, jwt: str) -> tuple[str, str]:
             jwt=jwt,
         )
     except VaultCliError as e:
-        msg = str(e)
-        if "step_up_required" in msg or "HTTP 403" in msg:
-            die("vault is locked. run `vault-unlock` to refresh.", code=2)
-        die(f"resolve failed for {episode_id}: {msg}")
+        denial = explain_denial(e)
+        if denial:
+            die(denial, code=2)
+        die(f"resolve failed for {episode_id}: {e}")
     return result["env_var"], result["value"]
 
 
