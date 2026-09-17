@@ -7,31 +7,39 @@ auth-code + PKCE flow (password + WebAuthn / TOTP / FIDO depending on
 realm config), captures the redirect on a loopback port, exchanges the
 code for an access token, and caches it in libsecret.
 
-After unlock, ``vault-resolve`` and ``vault-run`` can fetch values for
-~5 min (the loa3 freshness window the server enforces —
-ACR_LOA3_MAX_AGE_SECONDS, default 300 s) without prompting again.
+After unlock, ``vault-resolve`` and ``vault-run`` can fetch values until
+the loa3 freshness window expires. That window is a SERVER setting
+(``ACR_LOA3_MAX_AGE_SECONDS``, default 300 s) read from
+``/api/v1/vault/policy`` — it is measured from the moment MFA completed
+(``auth_time``), not from token issue, and it is shorter than the token's
+own lifetime. ``--status`` prints how much of it is left.
 
 Encryption is server-side: Brain decrypts on read using the user's
 ``vault_dk`` Keycloak attribute. The plugin doesn't manage any key
 material itself.
 
+Only the SECOND FACTOR is re-challenged. loa3 expires; loa1 does not, so
+an existing Keycloak SSO session keeps satisfying it and you should not be
+asked for a username and password on a routine unlock. If you are, the
+realm's loa3 conditional subflow is misconfigured — see --force-login.
+
 Usage:
-    vault-unlock           # browser MFA, cache JWT
-    vault-unlock --status  # print whether unlocked
-    vault-unlock --clear   # clear cached JWT
-    vault-unlock --force   # re-authenticate even if cache is fresh
+    vault-unlock              # step-up MFA only, cache JWT
+    vault-unlock --status     # print whether unlocked + freshness left
+    vault-unlock --clear      # clear cached JWT
+    vault-unlock --force      # re-authenticate even if cache is fresh
+    vault-unlock --force-login  # full username+password re-auth (escape hatch)
 """
 
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     discover_brain_url, get_cached_jwt, mint_loa3_jwt, clear_cached_jwt,
-    _decode_jwt_email,
+    _decode_jwt_email, _read_with_expiry, fetch_loa3_window, jwt_auth_age,
 )
 
 
@@ -42,30 +50,76 @@ def main(argv: list[str]) -> int:
 
     brain_url = discover_brain_url()
 
-    if "--status" in argv:
-        jwt = get_cached_jwt(brain_url)
-        if jwt:
-            email = _decode_jwt_email(jwt) or "(unknown)"
-            print(f"vault: unlocked for {email} (JWT cached)")
-            return 0
-        print("vault: locked — run `vault-unlock` to complete MFA")
-        return 1
-
     if "--clear" in argv:
         clear_cached_jwt(brain_url)
         print("vault: cache cleared")
         return 0
 
-    cached_jwt = get_cached_jwt(brain_url)
+    # An unexpired token authenticates the policy lookup even when it is
+    # already too stale to spend on a value read — /vault/policy carries
+    # no acr requirement.
+    unexpired = _read_with_expiry(kind="jwt", account=brain_url)
+    window = fetch_loa3_window(unexpired)
+    # "Unlocked" has to mean what the SERVER means by it. Judging the cache
+    # by the token's own `exp` alone reported unlocked for ~15 min while
+    # value reads started failing after `window` seconds, and then declined
+    # to re-authenticate because a token was present — an unlock loop with
+    # no exit (issue #192).
+    cached_jwt = get_cached_jwt(brain_url, max_auth_age=window)
+
+    if "--status" in argv:
+        if cached_jwt:
+            email = _decode_jwt_email(cached_jwt) or "(unknown)"
+            left = window - (jwt_auth_age(cached_jwt) or 0)
+            print(f"vault: unlocked for {email} — ~{left}s of loa3 freshness left")
+            return 0
+        if unexpired:
+            age = jwt_auth_age(unexpired)
+            detail = f"last MFA {age}s ago" if age is not None else "no auth_time claim"
+            print(
+                f"vault: locked — cached token is unexpired but stale "
+                f"({detail}, server accepts {window}s). Run `vault-unlock`."
+            )
+            return 1
+        print("vault: locked — run `vault-unlock` to complete MFA")
+        return 1
+
     if cached_jwt and "--force" not in argv:
         email = _decode_jwt_email(cached_jwt) or brain_url
-        print(f"vault: already unlocked for {email} (use --force to re-authenticate)")
+        left = window - (jwt_auth_age(cached_jwt) or 0)
+        print(
+            f"vault: already unlocked for {email} — ~{left}s left "
+            "(use --force to re-authenticate)"
+        )
         return 0
 
-    jwt, expires_at = mint_loa3_jwt(prompt=True)
-    remaining = int(expires_at - time.time())
+    jwt, _expires_at = mint_loa3_jwt(
+        prompt=True, force_full_login="--force-login" in argv
+    )
     email = _decode_jwt_email(jwt) or "(could not decode email from JWT)"
-    print(f"vault: unlocked for {email} for ~{remaining}s")
+
+    # Requesting a step-up without max_age means Keycloak may decide the
+    # session ALREADY satisfies loa3 and hand back the original auth_time.
+    # That is correct behaviour — unless the realm's loa3 conditional
+    # subflow has no max-age, in which case loa3 never expires there and
+    # the token can come back older than Brain will accept. Catch it here
+    # and name the realm as the fault, rather than silently forcing a full
+    # re-login (which is what made every unlock demand a password).
+    age = jwt_auth_age(jwt)
+    if age is not None and age > window:
+        print(
+            f"vault: warning — Keycloak returned a session authenticated {age}s ago, "
+            f"but Brain only accepts {window}s.\n"
+            "  Keycloak considers loa3 still satisfied, so it did not re-challenge.\n"
+            "  Fix: set `max-age` on the realm's loa3 conditional subflow (<= "
+            f"{window}s).\n"
+            "  Workaround for right now: vault-unlock --force-login",
+            file=sys.stderr,
+        )
+    # Report the loa3 window, not the token lifetime. `exp` is several times
+    # longer and quoting it is what taught everyone to expect ~15 minutes of
+    # working vault access from a token that stops working after `window`.
+    print(f"vault: unlocked for {email} — vault reads work for ~{window}s")
     return 0
 
 
