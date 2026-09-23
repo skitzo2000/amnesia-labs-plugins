@@ -1,11 +1,11 @@
 {
   "name": "brain",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "description": "Amnesia Labs internal alpha. Invite only.",
   "author": {
     "name": "Amnesia Labs",
     "url": "https://amnesia-labs.com"
   },
   "keywords": [],
-  "changelog": "v0.10.2 — the SessionStart update check now says when the server cannot answer it. A 404 from /api/v1/api/plugin/latest/version used to be indistinguishable from \"you are up to date\": the hook failed quiet, so no install ever learned an update existed while brain.amnesia-labs.com ran a build predating the endpoint (brain#231). The hook now tells the two 404s apart — a missing route (stale server) and an empty plugin store — and reports each in one line. Every other failure stays silent. Prior: v0.10.1 folded in the 0.9.3–0.9.7 store lineage."
+  "changelog": "v0.10.3 — the research skill no longer assumes the host can run subagents. Many self-hosted setups serve one model request at a time or have no Agent tool, and the skill's large-gap path told the model to spawn 5-8 parallel research agents regardless. It now picks an execution mode per host: parallel only when an Agent/Task tool is actually available, sequential when agents exist but the model server handles one request at a time, and inline (the model researches each facet itself with WebSearch/WebFetch) when there are no agents. Rounds, storage and citations are the same in every mode, and a failing mode drops to the next instead of abandoning the research. Prior: v0.10.2 — the SessionStart update check tells a stale server's 404 apart from an empty plugin store (brain#231)."
 }
