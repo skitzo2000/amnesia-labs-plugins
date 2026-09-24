@@ -7,14 +7,17 @@ hooks must propagate that error to the user, not trigger MFA themselves
 (the AI's tool-use surface is not the right place for an interactive
 auth challenge).
 
-Server-side encryption: Brain decrypts on read using the user's
-``vault_dk`` Keycloak attribute and returns plaintext over TLS. The
-plugin doesn't see or manage keys.
+Server-side encryption: Brain decrypts on read and returns plaintext over
+TLS. The plugin doesn't see or manage keys. If the vault uses
+factor-derived keys and is locked (423), the portal unlock page opens and
+vault-resolve waits up to 120 s for it, then retries once; pass
+``--no-wait`` to exit 2 instead (for hooks that must not block).
 
 Usage:
     vault-resolve <episode_id>          # uses default vault namespace
     vault-resolve --namespace <ns> <episode_id>
     vault-resolve --json <episode_id>   # machine-readable JSON output
+    vault-resolve --no-wait <episode_id>  # exit 2 on a locked vault
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
-    explain_denial,
+    explain_denial, handle_vault_locked, is_vault_locked,
 )
 
 
@@ -38,6 +41,8 @@ def main(argv: list[str]) -> int:
                    help="Vault namespace (default: derived from cached JWT email claim)")
     p.add_argument("--json", action="store_true",
                    help="Emit { value, env_var, value_type } as JSON to stdout")
+    p.add_argument("--no-wait", action="store_true",
+                   help="On a locked vault, exit 2 instead of opening the unlock page")
     args = p.parse_args(argv)
 
     ns = args.namespace or vault_namespace()
@@ -46,13 +51,25 @@ def main(argv: list[str]) -> int:
     except SystemExit:
         sys.exit(2)
 
-    try:
-        result = brain_request(
+    def _get():
+        return brain_request(
             "POST", "/api/v1/vault/value/get",
             body={"namespace": ns, "episode_id": args.episode_id},
             jwt=jwt,
         )
+
+    try:
+        try:
+            result = _get()
+        except VaultCliError as e:
+            if args.no_wait or not handle_vault_locked(e, ns, jwt):
+                raise
+            result = _get()
     except VaultCliError as e:
+        if is_vault_locked(e):
+            url = (e.payload or {}).get("unlock_url") or "the portal"
+            print(f"error: vault is locked — unlock it at {url}", file=sys.stderr)
+            return 2
         denial = explain_denial(e)
         if denial:
             print(f"error: {denial}", file=sys.stderr)
