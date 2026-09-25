@@ -11,8 +11,13 @@ All cryptography lives server-side now. The plugin's job is:
   3. Cache the JWT in libsecret with its expiry.
   4. Call Brain REST endpoints (plaintext value in/out over TLS).
 
-Brain encrypts/decrypts values with each user's ``vault_dk`` Keycloak
-attribute on the server side — the plugin never touches a key.
+Brain encrypts/decrypts values server-side — the plugin never touches a
+key. Legacy entries use each user's ``vault_dk`` Keycloak attribute. Once
+a user enrols factor-derived keys (#48), values are sealed to their vault
+public key and Brain can only open them while the user has unlocked the
+vault in the portal (passkey or recovery key). A read then answers 423
+``vault_locked`` with an ``unlock_url``; ``handle_vault_locked`` opens it
+and waits for the unlock, so the command just retries.
 
 Configuration is zero env vars by default — discovery handles it. Only
 fallback: ``BRAIN_URL`` if ``.mcp.json`` isn't readable.
@@ -618,16 +623,8 @@ def mint_loa3_jwt(
         )
         authorize = f"{meta['authorization_endpoint']}?" + urllib.parse.urlencode(params)
 
-        sys.stderr.write(
-            f"vault: complete MFA in your browser within {ttl}s\n"
-            f"  {_osc8_link(authorize)}\n"
-        )
-        sys.stderr.flush()
-
-        try:
-            _webbrowser.open(authorize, new=2)
-        except Exception:
-            pass
+        sys.stderr.write(f"vault: complete MFA in your browser within {ttl}s\n")
+        open_in_browser(authorize, "Click here to complete MFA")
 
         server_thread = _threading.Thread(target=srv.serve_forever, daemon=True)
         server_thread.start()
@@ -676,6 +673,31 @@ def mint_loa3_jwt(
     expires_at = int(time.time()) + expires_in
     store_jwt(account=brain_url, access_token=token, expires_at=expires_at)
     return token, expires_at
+
+
+def open_in_browser(url: str, label: str) -> bool:
+    """Print a clickable link to *url* and try to open it. True if opened.
+
+    Pass a SHORT label. Without one a ~400-char URL becomes the visible text
+    of the hyperlink, and an 80-column terminal wraps and truncates it
+    mid-query — losing parameters, so the server rejects it. The URL still
+    travels in full inside the OSC-8 escape, so clicking works.
+
+    Never silent: a terminal without OSC-8 shows the label as plain text
+    with no way to reach the URL, so when no browser was opened the raw URL
+    is printed too.
+    """
+    sys.stderr.write(f"  {_osc8_link(url, label)}\n")
+    sys.stderr.flush()
+    opened = False
+    try:
+        opened = bool(_webbrowser.open(url, new=2))
+    except Exception as e:
+        sys.stderr.write(f"vault: could not open a browser ({e})\n")
+    if not opened:
+        sys.stderr.write(f"vault: no browser was opened — paste this URL manually:\n{url}\n")
+    sys.stderr.flush()
+    return opened
 
 
 def get_jwt_or_die(*, prompt_password: bool) -> str:
@@ -761,3 +783,63 @@ def brain_request(
         )
     except Exception as e:
         raise VaultCliError(f"{method} {path} failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Factor-derived vault keys (#48) — the vault can be "locked" server-side
+# ---------------------------------------------------------------------------
+
+# How long to wait for the user to finish the portal unlock (passkey prompt).
+UNLOCK_WAIT_SECONDS = 120
+_UNLOCK_POLL_SECONDS = 2
+
+
+def is_vault_locked(err: VaultCliError) -> bool:
+    """True if Brain refused a read because the vault key is not unlocked."""
+    return err.status == 423 and (err.payload or {}).get("error") == "vault_locked"
+
+
+def fetch_unlock_status(ns: str, jwt: str) -> Optional[dict]:
+    """GET /vault/unlock/status. None when the server has no factor keys
+    (feature off, or an older Brain) — i.e. there is nothing to unlock."""
+    try:
+        return brain_request(
+            "GET", "/api/v1/vault/unlock/status", query={"namespace": ns}, jwt=jwt,
+        )
+    except VaultCliError as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def wait_for_unlock(ns: str, jwt: str, unlock_url: str,
+                    timeout: int = UNLOCK_WAIT_SECONDS,
+                    *, sleep=time.sleep, clock=time.monotonic) -> bool:
+    """Open the portal unlock page and poll until the key is held. True if unlocked."""
+    sys.stderr.write(
+        f"vault: {ns} is locked — unlock it in your browser (passkey or "
+        f"recovery key) within {timeout}s\n"
+    )
+    open_in_browser(unlock_url, "Click here to unlock the vault")
+    deadline = clock() + timeout
+    while clock() < deadline:
+        sleep(_UNLOCK_POLL_SECONDS)
+        try:
+            status = fetch_unlock_status(ns, jwt)
+        except VaultCliError:
+            continue  # transient; keep polling until the deadline
+        if status is not None and not status.get("locked", True):
+            sys.stderr.write("vault: unlocked\n")
+            sys.stderr.flush()
+            return True
+    return False
+
+
+def handle_vault_locked(err: VaultCliError, ns: str, jwt: str) -> bool:
+    """If *err* is a 423 vault_locked, run the unlock wait. True means retry."""
+    if not is_vault_locked(err):
+        return False
+    url = (err.payload or {}).get("unlock_url")
+    if not url:
+        return False
+    return wait_for_unlock(ns, jwt, url)

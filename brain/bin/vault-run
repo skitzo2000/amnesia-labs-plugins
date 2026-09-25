@@ -8,8 +8,10 @@ without the value entering the AI's transcript.
       curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
 
 Behavior:
-  1. Resolve each <episode_id> via vault-resolve (which uses a cached
-     loa3 JWT — run vault-unlock first to complete MFA).
+  1. Resolve each <episode_id> via Brain (using the cached loa3 JWT —
+     run vault-unlock first to complete MFA). If the vault uses
+     factor-derived keys and is locked, the portal unlock page opens and
+     vault-run waits (up to 120 s) for the unlock, then retries once.
   2. Export each value as $<env_var> (where env_var comes from the
      vault catalog) into the subshell environment of the wrapped cmd.
   3. Stream the wrapped cmd's stdout/stderr through a redactor that
@@ -35,7 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
-    explain_denial,
+    explain_denial, handle_vault_locked, is_vault_locked,
 )
 
 
@@ -54,21 +56,37 @@ def _split_args(argv: list[str]) -> tuple[list[str], list[str]]:
 
 
 def _resolve_one(episode_id: str, ns: str, jwt: str) -> tuple[str, str]:
-    """Return (env_var, value) for *episode_id*. Server decrypts with
-    the user's Keycloak vault_dk and returns plaintext over TLS.
+    """Return (env_var, value) for *episode_id*. Brain decrypts server-side
+    and returns plaintext over TLS. A 423 (vault key locked) opens the
+    portal unlock page, waits for it, and retries once.
     """
-    try:
-        result = brain_request(
+    def _get():
+        return brain_request(
             "POST", "/api/v1/vault/value/get",
             body={"namespace": ns, "episode_id": episode_id},
             jwt=jwt,
         )
+
+    try:
+        result = _get()
     except VaultCliError as e:
-        denial = explain_denial(e)
-        if denial:
-            die(denial, code=2)
-        die(f"resolve failed for {episode_id}: {e}")
+        if handle_vault_locked(e, ns, jwt):
+            try:
+                result = _get()
+            except VaultCliError as e2:
+                _fail(episode_id, e2)
+        else:
+            _fail(episode_id, e)
     return result["env_var"], result["value"]
+
+
+def _fail(episode_id: str, e: VaultCliError) -> None:
+    if is_vault_locked(e):
+        die("vault is still locked — unlock it in the portal, then re-run", code=2)
+    denial = explain_denial(e)
+    if denial:
+        die(denial, code=2)
+    die(f"resolve failed for {episode_id}: {e}")
 
 
 def _stream_redacted(stream_in, stream_out, redactor: re.Pattern, replacements: dict[str, str]) -> None:

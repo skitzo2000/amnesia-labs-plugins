@@ -14,9 +14,12 @@ the loa3 freshness window expires. That window is a SERVER setting
 (``auth_time``), not from token issue, and it is shorter than the token's
 own lifetime. ``--status`` prints how much of it is left.
 
-Encryption is server-side: Brain decrypts on read using the user's
-``vault_dk`` Keycloak attribute. The plugin doesn't manage any key
-material itself.
+Encryption is server-side; the plugin doesn't manage any key material.
+If you have enrolled factor-derived vault keys (#48), there is a second
+lock: Brain can only open your values while the vault key is unlocked in
+the portal (passkey or recovery key). After MFA, vault-unlock checks that
+too and, if it is locked, opens the portal unlock page and waits for it.
+``--status`` reports both windows.
 
 Only the SECOND FACTOR is re-challenged. loa3 expires; loa1 does not, so
 an existing Keycloak SSO session keeps satisfying it and you should not be
@@ -40,7 +43,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     discover_brain_url, get_cached_jwt, mint_loa3_jwt, clear_cached_jwt,
     _decode_jwt_email, _read_with_expiry, fetch_loa3_window, jwt_auth_age,
+    VaultCliError, fetch_unlock_status, vault_namespace, wait_for_unlock,
 )
+
+
+def _key_status(jwt: str):
+    """Server-side vault key status, or None if there is nothing to unlock."""
+    try:
+        return fetch_unlock_status(vault_namespace(), jwt)
+    except VaultCliError as e:
+        print(f"vault: could not check the vault key status ({e})", file=sys.stderr)
+        return None
+
+
+def _key_status_line(jwt: str) -> str:
+    st = _key_status(jwt)
+    if st is None or not st.get("enrolled"):
+        return ""
+    if st.get("locked"):
+        return "; vault key locked — values need a portal unlock"
+    return f"; vault key unlocked for ~{st.get('expires_in', 0)}s"
+
+
+def _ensure_key_unlocked(jwt: str) -> int:
+    """After MFA: if the vault key is enrolled and locked, run the portal unlock."""
+    st = _key_status(jwt)
+    if st is None or not st.get("enrolled") or not st.get("locked"):
+        return 0
+    if wait_for_unlock(st.get("namespace") or vault_namespace(), jwt, st["unlock_url"]):
+        return 0
+    print(
+        "vault: MFA is done but the vault key is still locked — finish the "
+        "unlock in the portal, then retry",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def main(argv: list[str]) -> int:
@@ -71,7 +108,8 @@ def main(argv: list[str]) -> int:
         if cached_jwt:
             email = _decode_jwt_email(cached_jwt) or "(unknown)"
             left = window - (jwt_auth_age(cached_jwt) or 0)
-            print(f"vault: unlocked for {email} — ~{left}s of loa3 freshness left")
+            print(f"vault: unlocked for {email} — ~{left}s of loa3 freshness left"
+                  f"{_key_status_line(cached_jwt)}")
             return 0
         if unexpired:
             age = jwt_auth_age(unexpired)
@@ -91,7 +129,7 @@ def main(argv: list[str]) -> int:
             f"vault: already unlocked for {email} — ~{left}s left "
             "(use --force to re-authenticate)"
         )
-        return 0
+        return _ensure_key_unlocked(cached_jwt)
 
     jwt, _expires_at = mint_loa3_jwt(
         prompt=True, force_full_login="--force-login" in argv
@@ -120,7 +158,7 @@ def main(argv: list[str]) -> int:
     # longer and quoting it is what taught everyone to expect ~15 minutes of
     # working vault access from a token that stops working after `window`.
     print(f"vault: unlocked for {email} — vault reads work for ~{window}s")
-    return 0
+    return _ensure_key_unlocked(jwt)
 
 
 if __name__ == "__main__":
