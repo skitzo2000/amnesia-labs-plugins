@@ -14,10 +14,19 @@ set -uo pipefail
 NAMESPACE="$(basename "$PWD")"
 SESSION_ID="session:$(date +%s)-${NAMESPACE}"
 
+# Claude Code's own session id (a random UUID) from the hook input. The
+# vault binds a session grant to it, so one vault-unlock covers this session
+# and no other; the SessionEnd hook closes the grant with the same id.
+HOOK_INPUT="$( [ -t 0 ] || cat )"
+CLAUDE_SESSION=$(printf '%s' "$HOOK_INPUT" | python3 -c "import sys,json,re; s=str(json.load(sys.stdin).get('session_id','')); print(s if re.fullmatch(r'[A-Za-z0-9-]{1,128}', s) else '')" 2>/dev/null || echo "")
+
 # Propagate env to every later hook (PreToolUse, PostToolUse, Stop)
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export BRAIN_NAMESPACE=$NAMESPACE" >> "$CLAUDE_ENV_FILE"
   echo "export BRAIN_SESSION_ID=$SESSION_ID" >> "$CLAUDE_ENV_FILE"
+  if [ -n "$CLAUDE_SESSION" ]; then
+    echo "export BRAIN_CLAUDE_SESSION=$CLAUDE_SESSION" >> "$CLAUDE_ENV_FILE"
+  fi
 fi
 
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}"
