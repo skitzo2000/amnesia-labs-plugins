@@ -72,6 +72,8 @@ def _key_status_line(jwt: str) -> str:
         return ""
     if st.get("locked"):
         return "; vault key locked — values need a portal unlock"
+    if st.get("session_hold"):
+        return "; vault key held until this Claude session ends"
     return f"; vault key unlocked for ~{st.get('expires_in', 0)}s"
 
 
