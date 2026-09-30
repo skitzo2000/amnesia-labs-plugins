@@ -90,6 +90,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/local/brain}/hooks/session_end_vault.py",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

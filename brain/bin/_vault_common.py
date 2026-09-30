@@ -92,6 +92,12 @@ def explain_denial(err: VaultCliError) -> Optional[str]:
     if reason == "stale_auth_time":
         age = payload.get("auth_age_seconds")
         window = payload.get("max_age_seconds")
+        if claude_session():
+            return (
+                f"this Claude session has no open vault grant (last MFA {age}s "
+                f"ago, server accepts {window}s without one). Run "
+                "`vault-unlock` once in this session."
+            )
         return (
             f"MFA is too old: last completed {age}s ago, server accepts "
             f"{window}s. Run `vault-unlock` to re-authenticate."
@@ -257,7 +263,27 @@ _LOA3_WINDOW_FALLBACK = 300
 # with 3 seconds of window left is not worth handing to vault-run.
 _LOA3_WINDOW_MARGIN = 15
 
-_loa3_window_cache: dict[str, int] = {}
+_policy_cache: dict[str, dict] = {}
+
+
+def _fetch_policy(jwt: Optional[str]) -> dict:
+    """GET /vault/policy once per process; {} when unreachable or no token."""
+    url = discover_brain_url()
+    if url in _policy_cache:
+        return _policy_cache[url]
+    policy: dict = {}
+    if jwt:
+        try:
+            policy = brain_request("GET", "/api/v1/vault/policy", jwt=jwt)
+        except Exception:
+            policy = {}
+    _policy_cache[url] = policy
+    return policy
+
+
+def server_has_session_grants(jwt: Optional[str]) -> bool:
+    """True if Brain lets one MFA cover a whole Claude session's reads."""
+    return bool(_fetch_policy(jwt).get("session_grant"))
 
 
 def fetch_loa3_window(jwt: Optional[str] = None) -> int:
@@ -276,21 +302,11 @@ def fetch_loa3_window(jwt: Optional[str] = None) -> int:
     unreachable — an older server is a reason to be conservative, not to
     fail the unlock.
     """
-    url = discover_brain_url()
-    if url in _loa3_window_cache:
-        return _loa3_window_cache[url]
-
-    window = _LOA3_WINDOW_FALLBACK
-    if jwt:
-        try:
-            policy = brain_request("GET", "/api/v1/vault/policy", jwt=jwt)
-            candidate = int(policy.get("loa3_max_age_seconds") or 0)
-            if candidate > 0:
-                window = candidate
-        except Exception:
-            pass
-    _loa3_window_cache[url] = window
-    return window
+    try:
+        candidate = int(_fetch_policy(jwt).get("loa3_max_age_seconds") or 0)
+    except (TypeError, ValueError):
+        candidate = 0
+    return candidate if candidate > 0 else _LOA3_WINDOW_FALLBACK
 
 
 def _sanitize_email(s: str) -> str:
@@ -448,6 +464,61 @@ def get_cached_jwt(account: str, *, max_auth_age: Optional[int] = None) -> Optio
 
 def clear_cached_jwt(account: str) -> None:
     _secret_tool_clear(service=_SCHEMA_SERVICE, kind="jwt", account=account)
+    _secret_tool_clear(service=_SCHEMA_SERVICE, kind="refresh", account=account)
+
+
+def _store_token_response(account: str, payload: dict) -> Optional[str]:
+    """Cache the access token (and refresh token, if any) from a token response."""
+    token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 0) or 0)
+    if not token or expires_in < 30:
+        return None
+    now = int(time.time())
+    store_jwt(account=account, access_token=token, expires_at=now + expires_in)
+    refresh = payload.get("refresh_token")
+    # Keycloak sends refresh_expires_in=0 for a refresh token that lives as
+    # long as the SSO session; keep it a day and let the server decide.
+    r_in = int(payload.get("refresh_expires_in", 0) or 0) or 86400
+    if refresh:
+        _store_with_expiry(kind="refresh", account=account, value=refresh,
+                           expires_at=now + r_in,
+                           label=f"Brain vault refresh token (exp:{now + r_in})")
+    return token
+
+
+def refresh_jwt(account: str) -> Optional[str]:
+    """Swap the cached refresh token for a new access token. None on failure.
+
+    Keycloak carries acr, auth_time and sid across a refresh, so the new
+    token still matches the session grant vault-unlock opened — it just
+    is not fresh enough to open a new one.
+    """
+    refresh = _read_with_expiry(kind="refresh", account=account)
+    if not refresh:
+        return None
+    try:
+        meta = discover_oauth_metadata(account)
+        body = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "client_id": SHARED_CLIENT_ID,
+            "refresh_token": refresh,
+        }).encode()
+        req = urllib.request.Request(
+            meta["token_endpoint"], data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        # Expired or revoked (SSO session ended): nothing to refresh.
+        _secret_tool_clear(service=_SCHEMA_SERVICE, kind="refresh", account=account)
+        return None
+    return _store_token_response(account, payload)
+
+
+def session_jwt(account: str) -> Optional[str]:
+    """An unexpired token for a grant-backed read, refreshing if needed."""
+    return _read_with_expiry(kind="jwt", account=account) or refresh_jwt(account)
 
 
 # ---------------------------------------------------------------------------
@@ -665,14 +736,10 @@ def mint_loa3_jwt(
     except Exception as e:
         die(f"token exchange request failed: {e}")
 
-    token = payload.get("access_token")
-    expires_in = int(payload.get("expires_in", 0))
-    if not token or expires_in < 30:
+    token = _store_token_response(brain_url, payload)
+    if not token:
         die("keycloak returned no usable access_token")
-
-    expires_at = int(time.time()) + expires_in
-    store_jwt(account=brain_url, access_token=token, expires_at=expires_at)
-    return token, expires_at
+    return token, int(time.time()) + int(payload.get("expires_in", 0))
 
 
 def open_in_browser(url: str, label: str) -> bool:
@@ -709,6 +776,16 @@ def get_jwt_or_die(*, prompt_password: bool) -> str:
     """
     brain_url = discover_brain_url()
     unexpired = _read_with_expiry(kind="jwt", account=brain_url)
+
+    # Inside a Claude session on a server with session grants, the grant
+    # vault-unlock opened is what authorises the read, not auth_time — so
+    # any unexpired (or refreshable) token will do and the server decides.
+    if claude_session():
+        tok = unexpired or refresh_jwt(brain_url)
+        if tok and server_has_session_grants(tok):
+            return tok
+        unexpired = tok
+
     window = fetch_loa3_window(unexpired)
 
     cached = get_cached_jwt(brain_url, max_auth_age=window)
@@ -729,6 +806,41 @@ def get_jwt_or_die(*, prompt_password: bool) -> str:
         )
     token, _ = mint_loa3_jwt(prompt=True)
     return token
+
+
+# ---------------------------------------------------------------------------
+# Session grants — one MFA covers one Claude Code session's reads
+# ---------------------------------------------------------------------------
+
+#: Set by the SessionStart hook to the Claude Code session id.
+SESSION_ENV = "BRAIN_CLAUDE_SESSION"
+
+
+def claude_session() -> str:
+    """This Claude Code session's id, or "" outside a session."""
+    return os.environ.get(SESSION_ENV, "").strip()
+
+
+def session_grant_open(jwt: str) -> bool:
+    """True if Brain holds a read grant for this token + Claude session."""
+    if not claude_session():
+        return False
+    try:
+        return bool(brain_request("GET", "/api/v1/vault/session", jwt=jwt).get("open"))
+    except VaultCliError:
+        return False
+
+
+def open_session_grant(ns: str, jwt: str) -> None:
+    """POST /vault/session with a fresh loa3 *jwt*. Raises VaultCliError."""
+    brain_request("POST", "/api/v1/vault/session", body={"namespace": ns}, jwt=jwt)
+
+
+def close_session_grant(ns: str, jwt: str) -> bool:
+    """DELETE /vault/session. True if a grant was open."""
+    res = brain_request("DELETE", "/api/v1/vault/session",
+                        query={"namespace": ns}, jwt=jwt)
+    return bool(res.get("was_open"))
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +874,8 @@ def brain_request(
     }
     if data is not None:
         headers["Content-Type"] = "application/json"
+    if claude_session():
+        headers["X-Brain-Session"] = claude_session()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:

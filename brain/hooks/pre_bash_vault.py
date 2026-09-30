@@ -73,7 +73,8 @@ def main() -> int:
                 "Example:\n"
                 "  vault-run secret:github:token -- "
                 "curl -H \"Authorization: Bearer $GH_TOKEN\" https://api.github.com/user\n\n"
-                "Run `vault-unlock` once per ~5 minutes to refresh the loa2 JWT."
+                "Run `vault-unlock` once per Claude session (it stays unlocked "
+                "until the session ends)."
             ),
         )
         return 0

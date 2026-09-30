@@ -7,8 +7,16 @@ auth-code + PKCE flow (password + WebAuthn / TOTP / FIDO depending on
 realm config), captures the redirect on a loopback port, exchanges the
 code for an access token, and caches it in libsecret.
 
-After unlock, ``vault-resolve`` and ``vault-run`` can fetch values until
-the loa3 freshness window expires. That window is a SERVER setting
+Inside Claude Code (``$BRAIN_CLAUDE_SESSION`` is set by the SessionStart
+hook) and against a Brain that supports session grants, the fresh MFA is
+spent on opening a read grant for THIS Claude session: ``vault-run`` and
+``vault-resolve`` then work until the session ends, when the SessionEnd
+hook closes the grant. Another Claude session has to unlock for itself.
+The access token is refreshed quietly; the grant, not ``auth_time``, is
+what the server checks.
+
+Outside a session (or on an older Brain), reads work until the loa3
+freshness window expires. That window is a SERVER setting
 (``ACR_LOA3_MAX_AGE_SECONDS``, default 300 s) read from
 ``/api/v1/vault/policy`` — it is measured from the moment MFA completed
 (``auth_time``), not from token issue, and it is shorter than the token's
@@ -44,6 +52,8 @@ from _vault_common import (  # noqa: E402
     discover_brain_url, get_cached_jwt, mint_loa3_jwt, clear_cached_jwt,
     _decode_jwt_email, _read_with_expiry, fetch_loa3_window, jwt_auth_age,
     VaultCliError, fetch_unlock_status, vault_namespace, wait_for_unlock,
+    claude_session, session_jwt, server_has_session_grants, session_grant_open,
+    open_session_grant, die,
 )
 
 
@@ -80,6 +90,38 @@ def _ensure_key_unlocked(jwt: str) -> int:
     return 1
 
 
+def _session_main(argv: list[str], brain_url: str, tok: str, window: int) -> int:
+    """vault-unlock inside a Claude session on a Brain with session grants."""
+    email = _decode_jwt_email(tok) or brain_url
+    is_open = session_grant_open(tok)
+
+    if "--status" in argv:
+        if is_open:
+            print(f"vault: unlocked for {email} for this Claude session"
+                  f"{_key_status_line(tok)}")
+            return 0
+        print("vault: locked for this Claude session — run `vault-unlock`")
+        return 1
+
+    if is_open and "--force" not in argv:
+        print(f"vault: already unlocked for {email} for this Claude session "
+              "(use --force to re-authenticate)")
+        return _ensure_key_unlocked(tok)
+
+    fresh = None if "--force" in argv else get_cached_jwt(brain_url, max_auth_age=window)
+    if fresh is None:
+        fresh, _ = mint_loa3_jwt(prompt=True, force_full_login="--force-login" in argv)
+    try:
+        open_session_grant(vault_namespace(), fresh)
+    except VaultCliError as e:
+        die(f"MFA is done but Brain would not open a session grant: {e}\n"
+            "  If it says stale_auth_time, the realm returned an old session — "
+            "try `vault-unlock --force-login`.")
+    email = _decode_jwt_email(fresh) or email
+    print(f"vault: unlocked for {email} until this Claude session ends")
+    return _ensure_key_unlocked(fresh)
+
+
 def main(argv: list[str]) -> int:
     if "--help" in argv or "-h" in argv:
         print(__doc__)
@@ -96,6 +138,18 @@ def main(argv: list[str]) -> int:
     # already too stale to spend on a value read — /vault/policy carries
     # no acr requirement.
     unexpired = _read_with_expiry(kind="jwt", account=brain_url)
+
+    if claude_session():
+        tok = session_jwt(brain_url)
+        if tok is None and "--status" not in argv:
+            # Nothing cached to ask the policy with: MFA first. The fresh
+            # token is picked up again by _session_main to open the grant.
+            tok, _ = mint_loa3_jwt(
+                prompt=True, force_full_login="--force-login" in argv)
+        if tok and server_has_session_grants(tok):
+            return _session_main(argv, brain_url, tok, fetch_loa3_window(tok))
+        unexpired = unexpired or tok
+
     window = fetch_loa3_window(unexpired)
     # "Unlocked" has to mean what the SERVER means by it. Judging the cache
     # by the token's own `exp` alone reported unlocked for ~15 min while
