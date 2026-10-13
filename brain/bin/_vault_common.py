@@ -267,16 +267,22 @@ _policy_cache: dict[str, dict] = {}
 
 
 def _fetch_policy(jwt: Optional[str]) -> dict:
-    """GET /vault/policy once per process; {} when unreachable or no token."""
+    """GET /vault/policy once per process; {} when unreachable or no token.
+
+    Only a real answer is cached. Caching a failed lookup as {} used to
+    turn one network blip into "this Brain has no session grants" for the
+    rest of the process, and vault-unlock quietly fell back to the old
+    300s mode.
+    """
     url = discover_brain_url()
     if url in _policy_cache:
         return _policy_cache[url]
-    policy: dict = {}
-    if jwt:
-        try:
-            policy = brain_request("GET", "/api/v1/vault/policy", jwt=jwt)
-        except Exception:
-            policy = {}
+    if not jwt:
+        return {}
+    try:
+        policy = brain_request("GET", "/api/v1/vault/policy", jwt=jwt)
+    except Exception:
+        return {}
     _policy_cache[url] = policy
     return policy
 
@@ -284,6 +290,11 @@ def _fetch_policy(jwt: Optional[str]) -> dict:
 def server_has_session_grants(jwt: Optional[str]) -> bool:
     """True if Brain lets one MFA cover a whole Claude session's reads."""
     return bool(_fetch_policy(jwt).get("session_grant"))
+
+
+def server_has_approvals(jwt: Optional[str]) -> bool:
+    """True if Brain has per-user vault policies and portal approval (brain#253)."""
+    return "grant_ttl_seconds" in _fetch_policy(jwt)
 
 
 def fetch_loa3_window(jwt: Optional[str] = None) -> int:
@@ -767,21 +778,28 @@ def open_in_browser(url: str, label: str) -> bool:
     return opened
 
 
-def get_jwt_or_die(*, prompt_password: bool) -> str:
+def get_jwt_or_die(*, prompt_password: bool, approve: bool = False) -> str:
     """Return a JWT the server will accept for a value read, or exit.
 
     The unexpired cached token is good enough to ASK the server for its
     policy (``/vault/policy`` is catalog-grade — no acr required), so it
     is used for that even when it is too stale to spend on a value read.
+
+    *approve*: inside a Claude session with nothing cached at all, run the
+    portal approval (sign-in first, same tab) rather than give up.
     """
     brain_url = discover_brain_url()
     unexpired = _read_with_expiry(kind="jwt", account=brain_url)
 
     # Inside a Claude session on a server with session grants, the grant
-    # vault-unlock opened is what authorises the read, not auth_time — so
-    # any unexpired (or refreshable) token will do and the server decides.
+    # is what authorises the read, not auth_time — so any unexpired (or
+    # refreshable) token will do and the server decides.
     if claude_session():
         tok = unexpired or refresh_jwt(brain_url)
+        if tok is None and approve:
+            outcome, tok = approve_session(brain_url)
+            if outcome not in ("approved", "unsupported"):
+                die(f"vault: not opened — {explain_approval(outcome)}", code=2)
         if tok and server_has_session_grants(tok):
             return tok
         unexpired = tok
@@ -940,7 +958,15 @@ def wait_for_unlock(ns: str, jwt: str, unlock_url: str,
         sleep(_UNLOCK_POLL_SECONDS)
         try:
             status = fetch_unlock_status(ns, jwt)
-        except VaultCliError:
+        except VaultCliError as e:
+            if e.status == 401:
+                # The token expired mid-wait. Every later poll would 401
+                # too and report "still locked" — refresh, or say why.
+                fresh = refresh_jwt(discover_brain_url())
+                if fresh is None:
+                    sys.stderr.write("vault: signed out while waiting — run `vault-unlock` again\n")
+                    return False
+                jwt = fresh
             continue  # transient; keep polling until the deadline
         if status is not None and not status.get("locked", True):
             sys.stderr.write("vault: unlocked\n")
@@ -957,3 +983,268 @@ def handle_vault_locked(err: VaultCliError, ns: str, jwt: str) -> bool:
     if not url:
         return False
     return wait_for_unlock(ns, jwt, url)
+
+
+# ---------------------------------------------------------------------------
+# Approving a Claude session in the portal (brain#253)
+# ---------------------------------------------------------------------------
+#
+# On a Brain with per-user vault policies the CLI no longer runs its own
+# loa3 sign-in. It asks Brain for an approval request, prints the code,
+# and opens the portal link; the user meets their own policy there
+# (Keycloak decides how, Brain decides how often), unlocks the vault key
+# if their key mode needs it, and types the code. One browser journey in
+# one tab. The CLI only waits for the outcome.
+
+APPROVAL_POLL_SECONDS = 2
+
+
+def approval_label() -> str:
+    """What the portal shows as the request's origin: host and folder."""
+    import socket
+    host = (socket.gethostname() or "this machine").split(".")[0]
+    return f"{host} · {Path.cwd().name}"[:80]
+
+
+def request_approval(ns: str, jwt: str) -> dict:
+    """POST /vault/session/request. Raises VaultCliError."""
+    return brain_request(
+        "POST", "/api/v1/vault/session/request",
+        body={"namespace": ns, "label": approval_label()}, jwt=jwt,
+    )
+
+
+def show_approval(req: dict) -> None:
+    """Print the code first, then the link, so the code is on screen
+    before the user reaches the page that asks for it."""
+    sys.stderr.write(
+        f"vault: approve this Claude session in your browser — code {req['user_code']}\n"
+    )
+    sys.stderr.flush()
+
+
+def wait_for_approval(
+    request_id: str, account: str, timeout: int,
+    *, sleep=None, clock=None, interval: int = APPROVAL_POLL_SECONDS,
+) -> str:
+    """Poll until the request is approved, denied or expired.
+
+    Returns the final status, or "timeout". Re-reads (and if need be
+    refreshes) the token on every poll, so a token that expires during a
+    long wait doesn't turn every poll into a silent 401.
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + timeout
+    path = f"/api/v1/vault/session/request/{urllib.parse.quote(request_id, safe='')}"
+    while clock() < deadline:
+        sleep(interval)
+        jwt = session_jwt(account)
+        if jwt is None:
+            sys.stderr.write("vault: signed out while waiting — run `vault-unlock` again\n")
+            return "signed_out"
+        try:
+            status = brain_request("GET", path, jwt=jwt).get("status", "")
+        except VaultCliError as e:
+            if e.status == 404:
+                return "expired"
+            continue  # transient; keep polling until the deadline
+        if status in ("approved", "denied", "expired"):
+            return status
+    return "timeout"
+
+
+def _build_redirect_handler(captured: _CodeCapture, expected_state: str,
+                            done: _threading.Event, exchange):
+    """Loopback handler that finishes the sign-in INSIDE the request and
+    then redirects the same browser tab to wherever *exchange* says.
+
+    *exchange(code)* returns a URL to redirect to, or None for the plain
+    "signed in" page. The tab the user signed in with goes straight on to
+    the approval page instead of leaving them a second tab to find.
+    """
+    class Handler(_http_server.BaseHTTPRequestHandler):
+        def log_message(self, *a, **k):
+            return
+
+        def _send(self, status: int, body: str = "", location: str = ""):
+            self.send_response(status)
+            self.send_header("Cache-Control", "no-store")
+            if location:
+                self.send_header("Location", location)
+            data = body.encode("utf-8")
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != "/callback":
+                self._send(404)
+                return
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            try:
+                if params.get("state") != expected_state:
+                    captured.error = "state_mismatch"
+                    self._send(200, _callback_html(success=False, message="state mismatch"))
+                    return
+                if "error" in params:
+                    captured.error = params.get("error")
+                    captured.error_description = params.get("error_description")
+                    self._send(200, _callback_html(
+                        success=False,
+                        message=params.get("error_description") or params.get("error", "")))
+                    return
+                captured.code = params.get("code")
+                try:
+                    target = exchange(captured.code)
+                except Exception as e:  # shown in the tab and in the terminal
+                    captured.error = "exchange_failed"
+                    captured.error_description = str(e)
+                    self._send(200, _callback_html(success=False, message="sign-in failed"))
+                    return
+                if target:
+                    self._send(302, location=target)
+                else:
+                    self._send(200, _callback_html(success=True))
+            finally:
+                done.set()
+    return Handler
+
+
+def sign_in_then(next_url_for, *, ttl: int = 180) -> str:
+    """Plain sign-in on loopback (no acr: the SSO session usually makes it
+    silent), then redirect the same tab to ``next_url_for(token)``.
+
+    Returns the access token. *next_url_for* runs before the browser is
+    redirected, so it can create the approval request and print its code.
+    """
+    brain_url = discover_brain_url()
+    meta = discover_oauth_metadata(brain_url)
+    verifier, challenge = _pkce_pair()
+    state = secrets.token_urlsafe(24)
+    nonce = secrets.token_urlsafe(24)
+    captured = _CodeCapture()
+    done = _threading.Event()
+    result: dict = {}
+
+    with _socketserver.TCPServer(("127.0.0.1", 0), lambda *a: None) as srv:
+        host, port = srv.server_address
+        redirect_uri = f"http://{host}:{port}/callback"
+
+        def exchange(code: str):
+            payload = _token_request(meta["token_endpoint"], {
+                "grant_type": "authorization_code",
+                "client_id": SHARED_CLIENT_ID,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
+            })
+            token = _store_token_response(brain_url, payload)
+            if not token:
+                raise VaultCliError("keycloak returned no usable access_token")
+            result["token"] = token
+            return next_url_for(token)
+
+        srv.RequestHandlerClass = _build_redirect_handler(captured, state, done, exchange)
+        params = {
+            "client_id": SHARED_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": "openid email profile",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+            "nonce": nonce,
+        }
+        authorize = f"{meta['authorization_endpoint']}?" + urllib.parse.urlencode(params)
+        sys.stderr.write(f"vault: sign in to Brain in your browser within {ttl}s\n")
+        open_in_browser(authorize, "Click here to sign in")
+        thread = _threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            done.wait(timeout=ttl)
+        finally:
+            srv.shutdown()
+            thread.join(timeout=2)
+
+    if captured.error:
+        die(f"sign-in failed: {captured.error}"
+            f"{(' — ' + captured.error_description) if captured.error_description else ''}")
+    if "token" not in result:
+        die("sign-in timed out — nothing came back from the browser", code=2)
+    return result["token"]
+
+
+def _token_request(endpoint: str, form: dict) -> dict:
+    body = urllib.parse.urlencode(form).encode()
+    req = urllib.request.Request(
+        endpoint, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise VaultCliError(f"token exchange failed ({e.code})", status=e.code)
+
+
+def approve_session(account: str) -> tuple[str, Optional[str]]:
+    """Run the whole approval for this Claude session.
+
+    Returns (outcome, token): outcome is "approved", "denied", "expired",
+    "timeout", "signed_out", or "unsupported" (an older Brain; the caller
+    falls back to the loa3 flow, with the token from any sign-in done here).
+    """
+    tok = session_jwt(account)
+    req: dict = {}
+
+    if tok is None:
+        def after_sign_in(token: str) -> Optional[str]:
+            if not server_has_approvals(token):
+                return None
+            req.update(request_approval(vault_namespace(), token))
+            show_approval(req)
+            return req["approve_url"]
+        tok = sign_in_then(after_sign_in)
+        if not req:
+            return "unsupported", tok
+    else:
+        if not server_has_approvals(tok):
+            return "unsupported", tok
+        req.update(request_approval(vault_namespace(), tok))
+        show_approval(req)
+        open_in_browser(req["approve_url"], "Click here to approve")
+
+    outcome = wait_for_approval(req["request_id"], account, int(req.get("expires_in", 300)))
+    return outcome, session_jwt(account) or tok
+
+
+def explain_approval(outcome: str) -> str:
+    return {
+        "denied": "the request was denied in the browser",
+        "expired": "the request expired before it was approved — run it again",
+        "timeout": "no approval arrived in time — run it again",
+        "signed_out": "signed out while waiting — run it again",
+    }.get(outcome, f"approval ended: {outcome}")
+
+
+def is_step_up(err: VaultCliError) -> bool:
+    """True if Brain refused because the user's vault policy isn't met."""
+    return err.status == 403 and (err.payload or {}).get("error") == "step_up_required"
+
+
+def handle_step_up(err: VaultCliError, account: str) -> Optional[str]:
+    """In a Claude session on a Brain with approvals, a step-up 403 means
+    this session needs approval: run it and return a token to retry with.
+    None when it doesn't apply (the caller reports the error as before)."""
+    if not is_step_up(err) or not claude_session():
+        return None
+    sys.stderr.write("vault: this Claude session needs your approval to use the vault\n")
+    outcome, tok = approve_session(account)
+    if outcome == "approved":
+        return tok
+    if outcome == "unsupported":
+        return None
+    die(f"vault: not opened — {explain_approval(outcome)}", code=2)

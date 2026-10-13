@@ -30,7 +30,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
-    explain_denial, handle_vault_locked, is_vault_locked,
+    explain_denial, handle_vault_locked, is_vault_locked, handle_step_up,
+    discover_brain_url,
 )
 
 
@@ -47,7 +48,7 @@ def main(argv: list[str]) -> int:
 
     ns = args.namespace or vault_namespace()
     try:
-        jwt = get_jwt_or_die(prompt_password=False)
+        jwt = get_jwt_or_die(prompt_password=False, approve=not args.no_wait)
     except SystemExit:
         sys.exit(2)
 
@@ -62,7 +63,12 @@ def main(argv: list[str]) -> int:
         try:
             result = _get()
         except VaultCliError as e:
-            if args.no_wait or not handle_vault_locked(e, ns, jwt):
+            if args.no_wait:
+                raise
+            retry_jwt = handle_step_up(e, discover_brain_url())
+            if retry_jwt is not None:
+                jwt = retry_jwt
+            elif not handle_vault_locked(e, ns, jwt):
                 raise
             result = _get()
     except VaultCliError as e:
