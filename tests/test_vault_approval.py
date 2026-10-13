@@ -333,7 +333,7 @@ def test_vault_unlock_status_asks_brain(env, capsys):
     assert vu.main(["--status"]) == 1
     fake.grant_open, fake.grant_left = True, 900
     assert vu.main(["--status"]) == 0
-    assert "15 minutes" in capsys.readouterr().out
+    assert "(15 more minutes)" in capsys.readouterr().out
 
 
 def test_vault_run_step_up_runs_approval_and_retries(env, monkeypatch):

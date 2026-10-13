@@ -72,11 +72,12 @@ from _vault_common import (  # noqa: E402
 
 
 def _describe_ttl(seconds: int) -> str:
+    """How long the grant has left, as people say it."""
     if seconds >= 3600:
         h = round(seconds / 3600)
-        return f"up to {h}h (until this Claude session ends)"
+        return f"until this Claude session ends, at most {h}h"
     m = max(1, round(seconds / 60))
-    return f"{m} minute{'s' if m != 1 else ''}"
+    return f"{m} more minute{'s' if m != 1 else ''}"
 
 
 def _grant(tok: str) -> tuple[bool, int]:
@@ -97,7 +98,7 @@ def _approval_main(argv: list[str], brain_url: str):
             return None, tok
         is_open, left = _grant(tok)
         if is_open:
-            print(f"vault: open for this Claude session for {_describe_ttl(left)} more")
+            print(f"vault: open for this Claude session ({_describe_ttl(left)})")
             return 0, tok
         print("vault: not open for this Claude session — run `vault-unlock`")
         return 1, tok
@@ -105,8 +106,8 @@ def _approval_main(argv: list[str], brain_url: str):
     if tok is not None and "--force" not in argv and server_has_approvals(tok):
         is_open, left = _grant(tok)
         if is_open:
-            print(f"vault: already open for this Claude session for {_describe_ttl(left)} more "
-                  "(use --force to approve again)")
+            print(f"vault: already open for this Claude session ({_describe_ttl(left)}); "
+                  "use --force to approve again")
             return 0, tok
 
     outcome, tok = approve_session(brain_url)
@@ -116,7 +117,7 @@ def _approval_main(argv: list[str], brain_url: str):
         print(f"vault: not opened — {explain_approval(outcome)}", file=sys.stderr)
         return 1, tok
     _, left = _grant(tok) if tok else (False, 0)
-    print(f"vault: open for this Claude session for {_describe_ttl(left)}" if left
+    print(f"vault: open for this Claude session ({_describe_ttl(left)})" if left
           else "vault: open for this Claude session")
     return 0, tok
 
