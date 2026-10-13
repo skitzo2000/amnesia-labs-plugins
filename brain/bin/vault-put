@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""vault-put — store a vault value from a file or stdin, without a paste form.
+
+The value is read from ``--file`` or ``--stdin`` only, never from argv, so
+it cannot show up in ``ps`` or shell history, and it is never printed. On
+success vault-put prints the catalog metadata, nothing else. Brain
+encrypts server-side and writes the catalog entry, so the value is
+findable with ``r()`` like one stored through a drop link.
+
+Binary files need ``--base64``: the stored value is the base64 text, and
+a restore decodes it back to identical bytes:
+
+    vault-run <episode_id> -- sh -c 'printf %s "$ENV_VAR" | base64 -d > file'
+
+Text values (no ``--base64``) lose trailing newlines, so a token file
+saved by an editor or ``echo`` stores just the token.
+
+Writes need MFA within the server's loa3 window (``vault-unlock --status``
+shows it). A Claude session grant covers reads only, so inside a session
+run ``vault-unlock --force`` right before a write.
+
+Usage:
+    vault-put <episode_id> --env-var NAME (--file PATH | --stdin)
+              [--type TYPE] [--username ACCOUNT] [--purpose TEXT]
+              [--base64] [--rotate] [--namespace NS]
+
+Example:
+    vault-put secret:dns2:ota-key --env-var DNS2_OTA_KEY --type private_key \\
+        --file secrets/ota.key --base64 --purpose "dns2 OTA signing key"
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _vault_common import (  # noqa: E402
+    VaultCliError, brain_request, die, discover_brain_url, explain_denial,
+    fetch_loa3_window, get_cached_jwt, jwt_auth_age, _read_with_expiry,
+    vault_namespace,
+)
+
+VALUE_TYPES = ("token", "password", "api_key", "private_key", "client_secret")
+
+
+def read_value(args: argparse.Namespace) -> str:
+    """The value to store, from --file or --stdin. Exits on bad input."""
+    if args.file:
+        try:
+            raw = Path(args.file).read_bytes()
+        except OSError as e:
+            die(f"cannot read {args.file}: {e.strerror}")
+    else:
+        raw = sys.stdin.buffer.read()
+
+    if args.base64:
+        value = base64.b64encode(raw).decode("ascii")
+    else:
+        try:
+            value = raw.decode("utf-8").rstrip("\r\n")
+        except UnicodeDecodeError:
+            die("value is not UTF-8 text; pass --base64 to store a binary file")
+    if not value:
+        die("value is empty")
+    return value
+
+
+def write_jwt() -> str:
+    """A token with MFA inside the server's loa3 window, or exit 2.
+
+    Unlike reads, a session grant does not authorise writes: the server
+    checks auth_time on put/rotate, so only a fresh step-up will do.
+    """
+    brain_url = discover_brain_url()
+    unexpired = _read_with_expiry(kind="jwt", account=brain_url)
+    window = fetch_loa3_window(unexpired)
+    fresh = get_cached_jwt(brain_url, max_auth_age=window)
+    if fresh:
+        return fresh
+    age = jwt_auth_age(unexpired) if unexpired else None
+    when = f"last MFA was {age}s ago" if age is not None else "no MFA token cached"
+    print(
+        f"error: storing a value needs MFA within the last {window}s ({when}). "
+        "A session grant covers reads only. Run `vault-unlock --force`, then "
+        "retry vault-put.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="vault-put", description="Store a vault value.")
+    p.add_argument("episode_id", help="Catalog id, e.g. secret:dns2:ota-key")
+    p.add_argument("--env-var", required=True,
+                   help="Env var vault-run injects the value as")
+    p.add_argument("--type", choices=VALUE_TYPES, default=None, help="Value type")
+    p.add_argument("--username", default=None,
+                   help="Account the secret belongs to (stored in plaintext, searchable)")
+    p.add_argument("--purpose", default=None,
+                   help="Free text for the catalog entry (searchable)")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--file", help="Read the value from this file")
+    src.add_argument("--stdin", action="store_true", help="Read the value from stdin")
+    p.add_argument("--base64", action="store_true",
+                   help="Store the bytes base64-encoded (for binary files)")
+    p.add_argument("--rotate", action="store_true",
+                   help="Replace an existing value (put refuses to overwrite)")
+    p.add_argument("--namespace", default=None,
+                   help="Vault namespace (default: your own, from the cached JWT)")
+    args = p.parse_args(argv)
+
+    value = read_value(args)
+    ns = args.namespace or vault_namespace()
+    jwt = write_jwt()
+
+    body = {"namespace": ns, "episode_id": args.episode_id, "value": value,
+            "env_var": args.env_var}
+    for key, val in (("value_type", args.type), ("username", args.username),
+                     ("purpose", args.purpose)):
+        if val:
+            body[key] = val
+    path = "/api/v1/vault/value/rotate" if args.rotate else "/api/v1/vault/value/put"
+
+    try:
+        result = brain_request("POST", path, body=body, jwt=jwt)
+    except VaultCliError as e:
+        payload = e.payload or {}
+        error = str(payload.get("error") or "")
+        if e.status == 409 and "already exists" in error:
+            print(f"error: {args.episode_id} already exists; pass --rotate to "
+                  "replace its value", file=sys.stderr)
+            return 1
+        if e.status == 404 and args.rotate:
+            print(f"error: {args.episode_id} does not exist; drop --rotate to "
+                  "create it", file=sys.stderr)
+            return 1
+        if error == "owner_not_enrolled":
+            print(f"error: {payload.get('detail') or error}", file=sys.stderr)
+            return 1
+        if payload.get("reason") == "stale_auth_time":
+            print("error: the server says MFA is too old for a write. Run "
+                  "`vault-unlock --force`, then retry vault-put.", file=sys.stderr)
+            return 2
+        denial = explain_denial(e)
+        if denial:
+            print(f"error: {denial}", file=sys.stderr)
+            return 2
+        die(str(e))
+
+    print(json.dumps(result.get("metadata", {}), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
