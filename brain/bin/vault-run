@@ -37,7 +37,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_common import (  # noqa: E402
     VaultCliError, brain_request, get_jwt_or_die, vault_namespace, die,
-    explain_denial, handle_vault_locked, is_vault_locked,
+    explain_denial, handle_vault_locked, is_vault_locked, handle_step_up,
+    discover_brain_url,
 )
 
 
@@ -55,29 +56,39 @@ def _split_args(argv: list[str]) -> tuple[list[str], list[str]]:
     return episode_ids, cmd
 
 
-def _resolve_one(episode_id: str, ns: str, jwt: str) -> tuple[str, str]:
-    """Return (env_var, value) for *episode_id*. Brain decrypts server-side
-    and returns plaintext over TLS. A 423 (vault key locked) opens the
-    portal unlock page, waits for it, and retries once.
+def _resolve_one(episode_id: str, ns: str, jwt: str) -> tuple[str, str, str]:
+    """Return (env_var, value, jwt) for *episode_id*. Brain decrypts
+    server-side and returns plaintext over TLS. A 423 (vault key locked)
+    opens the portal unlock page, waits for it, and retries once; inside a
+    Claude session a step-up 403 runs the portal approval and retries once.
+    The jwt returned is the one to use for the next id.
     """
-    def _get():
+    def _get(tok: str):
         return brain_request(
             "POST", "/api/v1/vault/value/get",
             body={"namespace": ns, "episode_id": episode_id},
-            jwt=jwt,
+            jwt=tok,
         )
 
     try:
-        result = _get()
+        result = _get(jwt)
     except VaultCliError as e:
-        if handle_vault_locked(e, ns, jwt):
-            try:
-                result = _get()
-            except VaultCliError as e2:
-                _fail(episode_id, e2)
-        else:
+        retry_jwt = handle_step_up(e, discover_brain_url())
+        if retry_jwt is not None:
+            jwt = retry_jwt
+        elif not handle_vault_locked(e, ns, jwt):
             _fail(episode_id, e)
-    return result["env_var"], result["value"]
+        try:
+            result = _get(jwt)
+        except VaultCliError as e2:
+            if handle_vault_locked(e2, ns, jwt):
+                try:
+                    result = _get(jwt)
+                except VaultCliError as e3:
+                    _fail(episode_id, e3)
+            else:
+                _fail(episode_id, e2)
+    return result["env_var"], result["value"], jwt
 
 
 def _fail(episode_id: str, e: VaultCliError) -> None:
@@ -108,13 +119,13 @@ def main(argv: list[str]) -> int:
         ns = episode_ids[1]
         episode_ids = episode_ids[2:]
 
-    jwt = get_jwt_or_die(prompt_password=False)
+    jwt = get_jwt_or_die(prompt_password=False, approve=True)
 
     # Resolve all values up front — fail fast before exec.
     env_overlay: dict[str, str] = {}
     redaction_map: dict[str, str] = {}
     for eid in episode_ids:
-        env_var, value = _resolve_one(eid, ns, jwt)
+        env_var, value, jwt = _resolve_one(eid, ns, jwt)
         if env_var in env_overlay and env_overlay[env_var] != value:
             die(f"two episodes resolved to the same env var '{env_var}'")
         env_overlay[env_var] = value

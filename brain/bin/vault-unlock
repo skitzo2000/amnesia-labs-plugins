@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""vault-unlock — complete MFA step-up and cache the loa3 JWT.
+"""vault-unlock — open this Claude session's access to the vault.
+
+On a Brain with per-user vault policies (brain#253), inside Claude Code:
+vault-unlock asks Brain for an approval, prints a short code and opens
+the portal link. In the browser you prove it's you the way YOUR vault
+security setting says (Keycloak decides how, Brain decides how often),
+unlock the vault key if your setting keeps it with you, and type the
+code. That's the whole journey, in one tab; vault-unlock just waits and
+then says how long this session can use the vault. With nothing cached,
+a sign-in comes first, in the same tab. ``--status`` asks Brain.
+
+Everything below describes the older flow, still used against a Brain
+without approvals and outside a Claude session.
+
 
 Brain's vault value endpoints require an MFA-fresh JWT (acr=loa3).
 This command opens the user's browser to Keycloak, runs the standard
@@ -53,8 +66,59 @@ from _vault_common import (  # noqa: E402
     _decode_jwt_email, _read_with_expiry, fetch_loa3_window, jwt_auth_age,
     VaultCliError, fetch_unlock_status, vault_namespace, wait_for_unlock,
     claude_session, session_jwt, server_has_session_grants, session_grant_open,
-    open_session_grant, die,
+    open_session_grant, die, approve_session, explain_approval, brain_request,
+    server_has_approvals,
 )
+
+
+def _describe_ttl(seconds: int) -> str:
+    if seconds >= 3600:
+        h = round(seconds / 3600)
+        return f"up to {h}h (until this Claude session ends)"
+    m = max(1, round(seconds / 60))
+    return f"{m} minute{'s' if m != 1 else ''}"
+
+
+def _grant(tok: str) -> tuple[bool, int]:
+    try:
+        st = brain_request("GET", "/api/v1/vault/session", jwt=tok)
+    except VaultCliError:
+        return False, 0
+    return bool(st.get("open")), int(st.get("expires_in") or 0)
+
+
+def _approval_main(argv: list[str], brain_url: str):
+    """vault-unlock via portal approval. None means: this Brain predates
+    approvals, use the older flow (with the token, if a sign-in happened)."""
+    tok = session_jwt(brain_url)
+
+    if "--status" in argv:
+        if tok is None or not server_has_approvals(tok):
+            return None, tok
+        is_open, left = _grant(tok)
+        if is_open:
+            print(f"vault: open for this Claude session for {_describe_ttl(left)} more")
+            return 0, tok
+        print("vault: not open for this Claude session — run `vault-unlock`")
+        return 1, tok
+
+    if tok is not None and "--force" not in argv and server_has_approvals(tok):
+        is_open, left = _grant(tok)
+        if is_open:
+            print(f"vault: already open for this Claude session for {_describe_ttl(left)} more "
+                  "(use --force to approve again)")
+            return 0, tok
+
+    outcome, tok = approve_session(brain_url)
+    if outcome == "unsupported":
+        return None, tok
+    if outcome != "approved":
+        print(f"vault: not opened — {explain_approval(outcome)}", file=sys.stderr)
+        return 1, tok
+    _, left = _grant(tok) if tok else (False, 0)
+    print(f"vault: open for this Claude session for {_describe_ttl(left)}" if left
+          else "vault: open for this Claude session")
+    return 0, tok
 
 
 def _key_status(jwt: str):
@@ -140,6 +204,12 @@ def main(argv: list[str]) -> int:
     # already too stale to spend on a value read — /vault/policy carries
     # no acr requirement.
     unexpired = _read_with_expiry(kind="jwt", account=brain_url)
+
+    if claude_session() and "--force-login" not in argv:
+        code, tok = _approval_main(argv, brain_url)
+        if code is not None:
+            return code
+        unexpired = unexpired or tok
 
     if claude_session():
         tok = session_jwt(brain_url)
