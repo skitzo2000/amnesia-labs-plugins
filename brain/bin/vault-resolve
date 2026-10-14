@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vault-resolve — fetch a vault value using a cached loa3 JWT.
+"""vault-resolve — fetch a vault value using a cached MFA token.
 
 Designed for non-interactive use by PreToolUse hooks. If no fresh JWT
 is cached, exits with code 2 and a "run vault-unlock first" message —

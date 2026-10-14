@@ -14,10 +14,10 @@ Everything below describes the older flow, still used against a Brain
 without approvals and outside a Claude session.
 
 
-Brain's vault value endpoints require an MFA-fresh JWT (acr=loa3).
+Brain's vault value endpoints require an MFA-fresh JWT at the level
+the user's vault policy names (``required_acr`` from ``/vault/policy``).
 This command opens the user's browser to Keycloak, runs the standard
-auth-code + PKCE flow (password + WebAuthn / TOTP / FIDO depending on
-realm config), captures the redirect on a loopback port, exchanges the
+auth-code + PKCE flow (password, then a WebAuthn second factor), captures the redirect on a loopback port, exchanges the
 code for an access token, and caches it in libsecret.
 
 Inside Claude Code (``$BRAIN_CLAUDE_SESSION`` is set by the SessionStart
@@ -28,9 +28,9 @@ hook closes the grant. Another Claude session has to unlock for itself.
 The access token is refreshed quietly; the grant, not ``auth_time``, is
 what the server checks.
 
-Outside a session (or on an older Brain), reads work until the loa3
-freshness window expires. That window is a SERVER setting
-(``ACR_LOA3_MAX_AGE_SECONDS``, default 300 s) read from
+Outside a session (or on an older Brain), reads work until the vault
+freshness window expires. That window is a SERVER setting (the user's
+vault policy) read from
 ``/api/v1/vault/policy`` — it is measured from the moment MFA completed
 (``auth_time``), not from token issue, and it is shorter than the token's
 own lifetime. ``--status`` prints how much of it is left.
@@ -42,10 +42,10 @@ the portal (passkey or recovery key). After MFA, vault-unlock checks that
 too and, if it is locked, opens the portal unlock page and waits for it.
 ``--status`` reports both windows.
 
-Only the SECOND FACTOR is re-challenged. loa3 expires; loa1 does not, so
+Only the SECOND FACTOR is re-challenged. loa2 expires; loa1 does not, so
 an existing Keycloak SSO session keeps satisfying it and you should not be
 asked for a username and password on a routine unlock. If you are, the
-realm's loa3 conditional subflow is misconfigured — see --force-login.
+realm's loa2 conditional subflow is misconfigured — see --force-login.
 
 Usage:
     vault-unlock              # step-up MFA only, cache JWT
@@ -235,7 +235,7 @@ def main(argv: list[str]) -> int:
         if cached_jwt:
             email = _decode_jwt_email(cached_jwt) or "(unknown)"
             left = window - (jwt_auth_age(cached_jwt) or 0)
-            print(f"vault: unlocked for {email} — ~{left}s of loa3 freshness left"
+            print(f"vault: unlocked for {email} — ~{left}s of MFA freshness left"
                   f"{_key_status_line(cached_jwt)}")
             return 0
         if unexpired:
@@ -264,9 +264,9 @@ def main(argv: list[str]) -> int:
     email = _decode_jwt_email(jwt) or "(could not decode email from JWT)"
 
     # Requesting a step-up without max_age means Keycloak may decide the
-    # session ALREADY satisfies loa3 and hand back the original auth_time.
-    # That is correct behaviour — unless the realm's loa3 conditional
-    # subflow has no max-age, in which case loa3 never expires there and
+    # session ALREADY satisfies the level and hand back the original auth_time.
+    # That is correct behaviour — unless the realm's loa2 conditional
+    # subflow has no max-age, in which case loa2 never expires there and
     # the token can come back older than Brain will accept. Catch it here
     # and name the realm as the fault, rather than silently forcing a full
     # re-login (which is what made every unlock demand a password).
@@ -275,13 +275,13 @@ def main(argv: list[str]) -> int:
         print(
             f"vault: warning — Keycloak returned a session authenticated {age}s ago, "
             f"but Brain only accepts {window}s.\n"
-            "  Keycloak considers loa3 still satisfied, so it did not re-challenge.\n"
-            "  Fix: set `max-age` on the realm's loa3 conditional subflow (<= "
+            "  Keycloak considers the second factor still satisfied, so it did not re-challenge.\n"
+            "  Fix: set `max-age` on the realm's loa2 conditional subflow (<= "
             f"{window}s).\n"
             "  Workaround for right now: vault-unlock --force-login",
             file=sys.stderr,
         )
-    # Report the loa3 window, not the token lifetime. `exp` is several times
+    # Report the vault window, not the token lifetime. `exp` is several times
     # longer and quoting it is what taught everyone to expect ~15 minutes of
     # working vault access from a token that stops working after `window`.
     print(f"vault: unlocked for {email} — vault reads work for ~{window}s")

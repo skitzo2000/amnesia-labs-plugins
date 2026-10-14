@@ -5,7 +5,8 @@ All cryptography lives server-side now. The plugin's job is:
   1. Discover the Brain URL (from this plugin's ``.mcp.json`` or
      ``$BRAIN_URL``) and the Keycloak OAuth endpoints from Brain's
      RFC 9728 / 8414 discovery docs.
-  2. Mint a loa3 (MFA-fresh) JWT via authorization-code + PKCE on a
+  2. Mint an MFA-fresh JWT, at the level the user's vault policy names,
+     via authorization-code + PKCE on a
      loopback redirect, using the shared public ``brain-plugin-client``
      Brain already advertises.
   3. Cache the JWT in libsecret with its expiry.
@@ -87,7 +88,7 @@ def explain_denial(err: VaultCliError) -> Optional[str]:
 
     reason = payload.get("reason")
     current = payload.get("current_acr")
-    required = payload.get("required_acr", "loa3")
+    required = payload.get("required_acr") or _STEP_UP_ACR_FALLBACK
 
     if reason == "stale_auth_time":
         age = payload.get("auth_age_seconds")
@@ -252,7 +253,8 @@ def jwt_auth_age(jwt: str) -> Optional[int]:
     return int(time.time()) - auth_time
 
 
-# The loa3 freshness window is a SERVER policy (ACR_LOA3_MAX_AGE_SECONDS).
+# The vault freshness window is a SERVER policy (the user's vault policy;
+# ACR_LOA2_MAX_AGE_SECONDS before per-user policies).
 # This is only the fallback for a server too old to serve /vault/policy —
 # it matches src/config.py's default. Deliberately not tuned by hand: a
 # client guess that disagrees with the server is what produced the unlock
@@ -297,8 +299,32 @@ def server_has_approvals(jwt: Optional[str]) -> bool:
     return "grant_ttl_seconds" in _fetch_policy(jwt)
 
 
+#: Used only when Brain gives no ``required_acr``. Brain has two levels
+#: (brain#267): loa1 is the password, loa2 a WebAuthn second factor.
+_STEP_UP_ACR_FALLBACK = "loa2"
+
+
+def step_up_target(jwt: Optional[str] = None) -> tuple[str, bool]:
+    """Return (acr, full_login): what to ask Keycloak for on a step-up.
+
+    Both come from the user's own vault policy (``/vault/policy``), never
+    from the client. ``reauth == "login"`` (a password-only policy) means
+    the password itself must be re-entered, which only ``prompt=login``
+    does; every other policy re-asks just the second factor.
+    """
+    policy = _fetch_policy(jwt)
+    acr = policy.get("required_acr") or policy.get("required_acr_for_value")
+    if not isinstance(acr, str) or not acr:
+        acr = _STEP_UP_ACR_FALLBACK
+    return acr, policy.get("reauth") == "login"
+
+
 def fetch_loa3_window(jwt: Optional[str] = None) -> int:
-    """Return the server's loa3 freshness window in seconds.
+    """Return the server's vault freshness window in seconds.
+
+    The name predates brain#267, which removed loa3. The window is the
+    user's policy window (``max_age_seconds``); ``loa3_max_age_seconds``
+    is the same value under its old name, read from older Brains.
 
     ``vault-unlock`` previously called a cached JWT "unlocked" for as long
     as the token was unexpired (~15 min), while the server rejects a value
@@ -313,8 +339,10 @@ def fetch_loa3_window(jwt: Optional[str] = None) -> int:
     unreachable — an older server is a reason to be conservative, not to
     fail the unlock.
     """
+    policy = _fetch_policy(jwt)
     try:
-        candidate = int(_fetch_policy(jwt).get("loa3_max_age_seconds") or 0)
+        candidate = int(policy.get("max_age_seconds")
+                        or policy.get("loa3_max_age_seconds") or 0)
     except (TypeError, ValueError):
         candidate = 0
     return candidate if candidate > 0 else _LOA3_WINDOW_FALLBACK
@@ -373,7 +401,7 @@ def _secret_tool_store(label: str, value: str, **attrs: str) -> None:
         proc = subprocess.run(args, input=value, capture_output=True, text=True, check=False)
     except FileNotFoundError:
         die("secret-tool is not installed (libsecret on Linux). The plugin "
-            "uses it to cache the loa3 JWT between commands. Install via your "
+            "uses it to cache the MFA token between commands. Install via your "
             "package manager (e.g. `nix-shell -p libsecret` or apt install "
             "libsecret-tools).")
     if proc.returncode != 0:
@@ -533,7 +561,7 @@ def session_jwt(account: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Keycloak token mint (Authorization Code + PKCE on loopback) for loa3
+# Keycloak token mint (Authorization Code + PKCE on loopback) for a step-up
 # ---------------------------------------------------------------------------
 
 import hashlib
@@ -623,14 +651,20 @@ FULL_REAUTH_PARAMS = ("max_age", "prompt")
 
 def build_authorize_params(
     *, redirect_uri: str, challenge: str, state: str, nonce: str,
-    force_full_login: bool = False,
+    acr: str, force_full_login: bool = False,
 ) -> dict:
-    """Build the authorization-request params for a loa3 step-up.
+    """Build the authorization-request params for a step-up to *acr*.
 
-    **loa3 expires; loa1 does not.** Stepping up means re-running the factor
-    that went stale, not the whole login. `acr_values=loa3` alone lets
-    Keycloak's Conditional-LoA flow see that the live SSO session already
-    satisfies loa1/loa2 and run only the loa3 execution.
+    *acr* is the ``required_acr`` from the user's vault policy (see
+    :func:`step_up_target`). Until v0.11.1 it was hard-coded to ``loa3``,
+    a level brain#267 removed: Keycloak ignores an unknown acr, so the
+    step-up came back as a plain loa1 token the vault refuses.
+
+    **The second factor expires; loa1 does not.** Stepping up means
+    re-running the factor that went stale, not the whole login.
+    `acr_values=<acr>` alone lets Keycloak's Conditional-LoA flow see that
+    the live SSO session already satisfies loa1 and run only the second
+    factor.
 
     Two previous attempts got this wrong in the same way, which is why
     there is a test pinning the behaviour rather than the spelling:
@@ -645,19 +679,20 @@ def build_authorize_params(
     Nor can we send ``max_age=<brain's window>``: an SSO session hours old
     satisfies loa1 perfectly legitimately, and any ``max_age`` marks that
     stale too and demands the password again. Per-level freshness is a
-    **realm** concern — the ``max-age`` configured on the loa3 conditional
+    **realm** concern — the ``max-age`` configured on the loa2 conditional
     subflow — and that is the only thing that should decide whether the
     second factor is re-challenged.
 
-    *force_full_login* adds ``prompt=login`` deliberately, as an escape
-    hatch for a wedged session. Never the default.
+    *force_full_login* adds ``prompt=login``: for a password-only policy
+    (``reauth: login``), where the password is the factor that went stale,
+    and as an escape hatch for a wedged session.
     """
     params = {
         "client_id": SHARED_CLIENT_ID,
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "scope": "openid email profile",
-        "acr_values": "loa3",
+        "acr_values": acr,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
         "state": state,
@@ -671,20 +706,24 @@ def build_authorize_params(
 def mint_loa3_jwt(
     *, prompt: bool = True, ttl: int = 180, force_full_login: bool = False
 ) -> tuple[str, int]:
-    """Mint a fresh JWT with acr=loa3 via authorization-code + PKCE on
-    a loopback redirect. Auto-discovers everything; uses the shared
-    public ``brain-plugin-client``.
+    """Mint a fresh JWT at the vault policy's level via authorization-code
+    + PKCE on a loopback redirect. Auto-discovers everything; uses the
+    shared public ``brain-plugin-client``. (The name predates brain#267;
+    the level comes from :func:`step_up_target`, no longer loa3.)
 
     Requests a step-up only: the existing SSO session keeps satisfying
-    loa1/loa2 and Keycloak re-runs just the loa3 factor. Pass
-    *force_full_login* to add ``prompt=login`` and re-authenticate from
-    scratch — an escape hatch for a wedged session, never the default.
+    loa1 and Keycloak re-runs just the second factor. A password-only
+    policy, or *force_full_login*, adds ``prompt=login`` and
+    re-authenticates from scratch.
     """
     if not prompt:
-        die("loa3 JWT not cached and prompt=False; run `vault-unlock`")
+        die("no fresh MFA token cached and prompt=False; run `vault-unlock`")
 
     brain_url = discover_brain_url()
     meta = discover_oauth_metadata(brain_url)
+    # Any unexpired token can ask for the policy; with none, the fallback
+    # level applies.
+    acr, policy_login = step_up_target(_read_with_expiry(kind="jwt", account=brain_url))
 
     verifier, challenge = _pkce_pair()
     state = secrets.token_urlsafe(24)
@@ -700,8 +739,8 @@ def mint_loa3_jwt(
         redirect_uri = f"http://{host}:{port}/callback"
 
         params = build_authorize_params(
-            redirect_uri=redirect_uri, challenge=challenge,
-            state=state, nonce=nonce, force_full_login=force_full_login,
+            redirect_uri=redirect_uri, challenge=challenge, state=state,
+            nonce=nonce, acr=acr, force_full_login=force_full_login or policy_login,
         )
         authorize = f"{meta['authorization_endpoint']}?" + urllib.parse.urlencode(params)
 
@@ -814,13 +853,13 @@ def get_jwt_or_die(*, prompt_password: bool, approve: bool = False) -> str:
         age = jwt_auth_age(unexpired) if unexpired else None
         if age is not None:
             die(
-                f"cached loa3 JWT is stale: last MFA was {age}s ago, server "
+                f"cached MFA token is stale: last MFA was {age}s ago, server "
                 f"accepts {window}s. Run `vault-unlock` to re-authenticate."
             )
         die(
-            "no fresh loa3 JWT in cache. Run `vault-unlock` to complete MFA. "
+            "no fresh MFA token in cache. Run `vault-unlock` to complete MFA. "
             f"Cached tokens are usable for {window}s after MFA (the server's "
-            "loa3 freshness window)."
+            "vault freshness window)."
         )
     token, _ = mint_loa3_jwt(prompt=True)
     return token
@@ -850,7 +889,7 @@ def session_grant_open(jwt: str) -> bool:
 
 
 def open_session_grant(ns: str, jwt: str) -> None:
-    """POST /vault/session with a fresh loa3 *jwt*. Raises VaultCliError."""
+    """POST /vault/session with an MFA-fresh *jwt*. Raises VaultCliError."""
     brain_request("POST", "/api/v1/vault/session", body={"namespace": ns}, jwt=jwt)
 
 
@@ -990,7 +1029,7 @@ def handle_vault_locked(err: VaultCliError, ns: str, jwt: str) -> bool:
 # ---------------------------------------------------------------------------
 #
 # On a Brain with per-user vault policies the CLI no longer runs its own
-# loa3 sign-in. It asks Brain for an approval request, prints the code,
+# MFA sign-in. It asks Brain for an approval request, prints the code,
 # and opens the portal link; the user meets their own policy there
 # (Keycloak decides how, Brain decides how often), unlocks the vault key
 # if their key mode needs it, and types the code. One browser journey in
@@ -1195,7 +1234,7 @@ def approve_session(account: str) -> tuple[str, Optional[str]]:
 
     Returns (outcome, token): outcome is "approved", "denied", "expired",
     "timeout", "signed_out", or "unsupported" (an older Brain; the caller
-    falls back to the loa3 flow, with the token from any sign-in done here).
+    falls back to the step-up flow, with the token from any sign-in done here).
     """
     tok = session_jwt(account)
     req: dict = {}
