@@ -15,7 +15,7 @@ a restore decodes it back to identical bytes:
 Text values (no ``--base64``) lose trailing newlines, so a token file
 saved by an editor or ``echo`` stores just the token.
 
-Writes need MFA within the server's loa3 window (``vault-unlock --status``
+Writes need MFA within the server's vault window (``vault-unlock --status``
 shows it). A Claude session grant covers reads only, so inside a session
 run ``vault-unlock --force`` right before a write.
 
@@ -70,7 +70,7 @@ def read_value(args: argparse.Namespace) -> str:
 
 
 def write_jwt() -> str:
-    """A token with MFA inside the server's loa3 window, or exit 2.
+    """A token with MFA inside the server's vault window, or exit 2.
 
     Unlike reads, a session grant does not authorise writes: the server
     checks auth_time on put/rotate, so only a fresh step-up will do.

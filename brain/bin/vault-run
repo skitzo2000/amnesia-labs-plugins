@@ -8,7 +8,7 @@ without the value entering the AI's transcript.
       curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
 
 Behavior:
-  1. Resolve each <episode_id> via Brain (using the cached loa3 JWT —
+  1. Resolve each <episode_id> via Brain (using the cached MFA token —
      run vault-unlock first to complete MFA). If the vault uses
      factor-derived keys and is locked, the portal unlock page opens and
      vault-run waits (up to 120 s) for the unlock, then retries once.
