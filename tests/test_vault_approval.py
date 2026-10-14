@@ -74,6 +74,9 @@ def env(monkeypatch, capsys):
     fake = FakeBrain()
     vc._policy_cache.clear()
     monkeypatch.setenv(vc.SESSION_ENV, SESSION)
+    # Portal approval is opt-in from v0.11.1; the one-tap unlock is the
+    # default (tests/test_one_tap_unlock.py).
+    monkeypatch.setenv(vc.APPROVE_ENV, "1")
     monkeypatch.setattr(vc, "brain_request", fake)
     monkeypatch.setattr(vc, "discover_brain_url", lambda: ACCOUNT)
     monkeypatch.setattr(vc, "vault_namespace", lambda: "alice:vault")

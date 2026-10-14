@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """vault-unlock — open this Claude session's access to the vault.
 
-On a Brain with per-user vault policies (brain#253), inside Claude Code:
-vault-unlock asks Brain for an approval, prints a short code and opens
-the portal link. In the browser you prove it's you the way YOUR vault
-security setting says (Keycloak decides how, Brain decides how often),
-unlock the vault key if your setting keeps it with you, and type the
-code. That's the whole journey, in one tab; vault-unlock just waits and
-then says how long this session can use the vault. With nothing cached,
-a sign-in comes first, in the same tab. ``--status`` asks Brain.
+One tap: vault-unlock opens Keycloak at the level YOUR vault policy names
+(Brain decides how often). You touch your security key; with the realm's
+brain-vault login theme and a key linked to the vault, that same tap also
+unlocks the vault key. The token comes back on a 127.0.0.1 redirect, and
+inside Claude Code it opens this session's vault grant. No code to type,
+no portal page. A cold start (no Keycloak session) asks the password once
+first. vault-run runs the same unlock by itself when a read needs it, so
+calling vault-unlock first is optional.
 
-Everything below describes the older flow, still used against a Brain
-without approvals and outside a Claude session.
-
+``--approve`` (or ``BRAIN_VAULT_APPROVE=1``) uses the portal approval
+instead: a code typed in the browser, for a machine whose browser can't
+reach this one's 127.0.0.1 (SSH, a headless box).
 
 Brain's vault value endpoints require an MFA-fresh JWT at the level
 the user's vault policy names (``required_acr`` from ``/vault/policy``).
 This command opens the user's browser to Keycloak, runs the standard
-auth-code + PKCE flow (password, then a WebAuthn second factor), captures the redirect on a loopback port, exchanges the
-code for an access token, and caches it in libsecret.
+auth-code + PKCE flow (password, then a WebAuthn second factor),
+captures the redirect on a loopback port, exchanges the code for an
+access token, and caches it in libsecret.
 
 Inside Claude Code (``$BRAIN_CLAUDE_SESSION`` is set by the SessionStart
 hook) and against a Brain that supports session grants, the fresh MFA is
@@ -53,6 +54,7 @@ Usage:
     vault-unlock --clear      # clear cached JWT
     vault-unlock --force      # re-authenticate even if cache is fresh
     vault-unlock --force-login  # full username+password re-auth (escape hatch)
+    vault-unlock --approve    # portal approval with a typed code (no local browser)
 """
 
 from __future__ import annotations
@@ -67,7 +69,7 @@ from _vault_common import (  # noqa: E402
     VaultCliError, fetch_unlock_status, vault_namespace, wait_for_unlock,
     claude_session, session_jwt, server_has_session_grants, session_grant_open,
     open_session_grant, die, approve_session, explain_approval, brain_request,
-    server_has_approvals,
+    server_has_approvals, use_portal_approval,
 )
 
 
@@ -206,7 +208,11 @@ def main(argv: list[str]) -> int:
     # no acr requirement.
     unexpired = _read_with_expiry(kind="jwt", account=brain_url)
 
-    if claude_session() and "--force-login" not in argv:
+    # The portal approval (a code typed in the browser) is only for a
+    # machine whose browser can't reach this one's 127.0.0.1. Everywhere
+    # else the unlock is one tap on the Keycloak page (below).
+    approve = "--approve" in argv or use_portal_approval()
+    if claude_session() and approve and "--force-login" not in argv:
         code, tok = _approval_main(argv, brain_url)
         if code is not None:
             return code

@@ -825,7 +825,8 @@ def get_jwt_or_die(*, prompt_password: bool, approve: bool = False) -> str:
     is used for that even when it is too stale to spend on a value read.
 
     *approve*: inside a Claude session with nothing cached at all, run the
-    portal approval (sign-in first, same tab) rather than give up.
+    one-tap unlock (or the portal approval with BRAIN_VAULT_APPROVE)
+    rather than give up.
     """
     brain_url = discover_brain_url()
     unexpired = _read_with_expiry(kind="jwt", account=brain_url)
@@ -836,9 +837,12 @@ def get_jwt_or_die(*, prompt_password: bool, approve: bool = False) -> str:
     if claude_session():
         tok = unexpired or refresh_jwt(brain_url)
         if tok is None and approve:
-            outcome, tok = approve_session(brain_url)
-            if outcome not in ("approved", "unsupported"):
-                die(f"vault: not opened — {explain_approval(outcome)}", code=2)
+            if use_portal_approval():
+                outcome, tok = approve_session(brain_url)
+                if outcome not in ("approved", "unsupported"):
+                    die(f"vault: not opened — {explain_approval(outcome)}", code=2)
+            else:
+                return tap_open_grant(vault_namespace())
         if tok and server_has_session_grants(tok):
             return tok
         unexpired = tok
@@ -1274,16 +1278,48 @@ def is_step_up(err: VaultCliError) -> bool:
     return err.status == 403 and (err.payload or {}).get("error") == "step_up_required"
 
 
+#: Set to 1 to use the portal approval (a code typed in the browser)
+#: instead of the one-tap sign-in: for a machine with no local browser,
+#: where a 127.0.0.1 redirect can't come back.
+APPROVE_ENV = "BRAIN_VAULT_APPROVE"
+
+
+def use_portal_approval() -> bool:
+    return os.environ.get(APPROVE_ENV, "").strip() in ("1", "true", "yes")
+
+
+def tap_open_grant(ns: str) -> str:
+    """The one-tap unlock: sign in at the policy's level, open the grant.
+
+    One browser tab on Keycloak's loa2 page: the security key tap signs
+    in and, with the brain-vault login theme and a linked key, unlocks the
+    vault key too. The token comes back on a 127.0.0.1 redirect, which is
+    what proves the request came from this machine, so no code is typed.
+    Inside a Claude session the fresh token then opens this session's
+    grant. Returns the token. Exits on failure.
+    """
+    sys.stderr.write("vault: touch your security key in the browser tab that opened\n")
+    tok, _ = mint_loa3_jwt(prompt=True)
+    if claude_session():
+        try:
+            open_session_grant(ns, tok)
+        except VaultCliError as e:
+            die(f"signed in, but Brain would not open the vault for this session: {e}", code=2)
+    return tok
+
+
 def handle_step_up(err: VaultCliError, account: str) -> Optional[str]:
-    """In a Claude session on a Brain with approvals, a step-up 403 means
-    this session needs approval: run it and return a token to retry with.
-    None when it doesn't apply (the caller reports the error as before)."""
-    if not is_step_up(err) or not claude_session():
+    """A step-up 403: run the one-tap unlock (or, with BRAIN_VAULT_APPROVE,
+    the portal approval) and return a token to retry with. None when it
+    doesn't apply (the caller reports the error as before)."""
+    if not is_step_up(err):
         return None
-    sys.stderr.write("vault: this Claude session needs your approval to use the vault\n")
-    outcome, tok = approve_session(account)
-    if outcome == "approved":
-        return tok
-    if outcome == "unsupported":
-        return None
-    die(f"vault: not opened — {explain_approval(outcome)}", code=2)
+    if use_portal_approval() and claude_session():
+        sys.stderr.write("vault: this Claude session needs your approval to use the vault\n")
+        outcome, tok = approve_session(account)
+        if outcome == "approved":
+            return tok
+        if outcome == "unsupported":
+            return None
+        die(f"vault: not opened — {explain_approval(outcome)}", code=2)
+    return tap_open_grant(vault_namespace())
